@@ -18,11 +18,11 @@ sudo mkdir -p /opt/leafmc
 ```
 4. Make sure you own the directory
 ```bash
-sudo chown -r $USER:$USER /opt/leafmc
+sudo chown -R $USER:$USER /opt/leafmc
 ```
 5. Install this script
 ```bash
-git clone https://raw.githubusercontent.com/CallMeAlphabet/LeafMCManager/refs/heads/master/server.sh /opt/leafmc/
+curl -o /opt/leafmc/server.sh https://raw.githubusercontent.com/CallMeAlphabet/LeafMCManager/refs/heads/master/server.sh
 ```
 6. Make it executable
 ```bash
