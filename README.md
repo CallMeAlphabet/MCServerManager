@@ -24,7 +24,7 @@ sudo chown -R $USER:$USER /opt/leafmc
 ```
 5. Install this script
 ```bash
-curl -o /opt/leafmc/server.sh https://raw.githubusercontent.com/CallMeAlphabet/LeafMCManager/refs/heads/master/server.sh
+curl -o /opt/leafmc/server.sh https://raw.githubusercontent.com/CallMeAlphabet/LeafMCManager/refs/heads/main/server.sh
 ```
 6. Make it executable
 ```bash
