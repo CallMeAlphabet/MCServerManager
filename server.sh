@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  LeafMC Server Manager — /opt/leafmc/server.sh
+#  MCServerManager — /opt/mcservers/server.sh
+#
+#  Supports: LeafMC, Paper, Purpur, Spigot, Bukkit, Fabric, Vanilla
 #
 #  Dependencies:
-#    tmux      — pacman -S tmux
-#    mcrcon    — paru -S mcrcon
+#    tmux      — pacman -S tmux  |  apt install tmux
+#    mcrcon    — paru -S mcrcon  |  https://github.com/Tiiffi/mcrcon
+#    curl      — pacman -S curl  |  apt install curl
+#    openssl   — pacman -S openssl | apt install openssl
 # =============================================================================
 
 set -euo pipefail
 
-LEAFMC_DIR="/opt/leafmc"
-BACKUP_BASE="${LEAFMC_DIR}/backups"
-TMUX_PREFIX="leafmc"
+SERVERS_DIR="/opt/mcservers"
+BACKUP_BASE="${SERVERS_DIR}/backups"
+LOG_BASE="${SERVERS_DIR}/LOGS"
+TMUX_PREFIX="mcserver"
+SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -29,33 +35,64 @@ warn()    { echo -e "${YELLOW}${BOLD}[!]${RESET} $*"; }
 err()     { echo -e "${RED}${BOLD}[✗]${RESET} $*"; }
 sep()     { echo -e "${CYAN}$(printf '─%.0s' {1..60})${RESET}"; }
 
+# =============================================================================
+#  CLI MODE — before check_deps so cron doesn't get blocked by prompts
+# =============================================================================
+if [[ "${1:-}" == "--backup" && -n "${2:-}" ]]; then
+    _CLI_NAME="$2"
+    _CLI_DIR="${SERVERS_DIR}/${_CLI_NAME}"
+    _CLI_BACKUP=1
+else
+    _CLI_BACKUP=0
+fi
+
 # ── Dependency check ──────────────────────────────────────────────────────────
 check_deps() {
     local missing=()
-    command -v tmux   &>/dev/null || missing+=("tmux (pacman -S tmux)")
-    command -v mcrcon &>/dev/null || missing+=("mcrcon (paru -S mcrcon)")
+    command -v tmux    &>/dev/null || missing+=("tmux")
+    command -v mcrcon  &>/dev/null || missing+=("mcrcon")
+    command -v curl    &>/dev/null || missing+=("curl")
+    command -v openssl &>/dev/null || missing+=("openssl")
     if [[ "${#missing[@]}" -gt 0 ]]; then
-        warn "Missing dependencies:"
-        for dep in "${missing[@]}"; do
-            echo -e "    ${YELLOW}${dep}${RESET}"
-        done
+        warn "Missing dependencies: ${missing[*]}"
         echo
-        warn "Some features will be unavailable until these are installed."
+        warn "Some features will not work until these are installed."
         echo
         read -rp "$(echo -e "${BOLD}Press Enter to continue anyway...${RESET}")"
     fi
 }
 
-# ── Server config (.leafmc.conf) ──────────────────────────────────────────────
-conf_path()  { echo "${1}/.leafmc.conf"; }
+# =============================================================================
+#  SERVER METADATA  (/opt/mcservers/NAME/ServerManager/)
+# =============================================================================
+sm_dir()  { echo "${1}/ServerManager"; }
+sm_file() { echo "${1}/ServerManager/${2}"; }
+
+read_meta() {
+    local dir="$1" key="$2"
+    local f
+    f=$(sm_file "$dir" "$key")
+    [[ -f "$f" ]] && cat "$f" 2>/dev/null || echo ""
+}
+
+write_meta() {
+    local dir="$1" key="$2" value="$3"
+    mkdir -p "$(sm_dir "$dir")"
+    printf '%s\n' "$value" > "$(sm_file "$dir" "$key")"
+}
+
+server_name()    { basename "$1"; }
+server_type()    { read_meta "$1" "type"; }
+server_version() { read_meta "$1" "version"; }
+
+# ── RCON config (.mcserver.conf) ─────────────────────────────────────────────
+conf_path() { echo "${1}/.mcserver.conf"; }
 
 read_conf() {
     local dir="$1" key="$2"
     local conf
     conf=$(conf_path "$dir")
-    if [[ -f "$conf" ]]; then
-        grep -oP "(?<=^${key}=).+" "$conf" 2>/dev/null || true
-    fi
+    [[ -f "$conf" ]] && grep -oP "(?<=^${key}=).+" "$conf" 2>/dev/null || true
 }
 
 write_conf() {
@@ -69,7 +106,6 @@ write_conf() {
     fi
 }
 
-# ── RCON helpers ──────────────────────────────────────────────────────────────
 rcon_password() { read_conf "$1" "rcon_password"; }
 rcon_port()     { read_conf "$1" "rcon_port"; }
 
@@ -86,14 +122,15 @@ rcon_send() {
 }
 
 rcon_available() {
-    local dir="$1"
     command -v mcrcon &>/dev/null && \
-    [[ -n "$(rcon_password "$dir")" ]] && \
-    [[ -n "$(rcon_port "$dir")" ]]
+    [[ -n "$(rcon_password "$1")" ]] && \
+    [[ -n "$(rcon_port "$1")" ]]
 }
 
-# ── tmux session helpers ──────────────────────────────────────────────────────
-session_name() { echo "${TMUX_PREFIX}-$(basename "$1" | tr '.' '_')"; }
+# =============================================================================
+#  TMUX / PROCESS HELPERS
+# =============================================================================
+session_name() { echo "${TMUX_PREFIX}-$(basename "$1" | tr ' .' '_')"; }
 
 server_running() {
     local sess
@@ -101,15 +138,34 @@ server_running() {
     tmux has-session -t "$sess" 2>/dev/null
 }
 
-# ── Server state detection ────────────────────────────────────────────────────
+# Find the java process for this server by matching the server directory path.
+get_server_pid() {
+    pgrep -f "java.*${1}" 2>/dev/null | head -1 || true
+}
+
+get_resource_usage() {
+    local pid="$1"
+    [[ -z "$pid" ]] && { echo "? ?"; return; }
+    local cpu mem_kb mem_mb
+    cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ' || echo "?")
+    mem_kb=$(ps -p "$pid" -o rss= 2>/dev/null | tr -d ' ' || echo "0")
+    mem_mb=$(( ${mem_kb:-0} / 1024 ))
+    echo "$cpu $mem_mb"
+}
+
+# =============================================================================
+#  SERVER STATE DETECTION
+# =============================================================================
 server_state() {
     local dir="$1"
-    local jar_count other_count
-    jar_count=$(find "$dir" -maxdepth 1 -type f -name "*.jar" | wc -l)
-    other_count=$(find "$dir" -maxdepth 1 -mindepth 1 | wc -l)
-    if [[ "$jar_count" -eq 0 ]];                              then echo "empty"
-    elif [[ "$jar_count" -eq 1 && "$other_count" -eq 1 ]];   then echo "fresh"
-    else                                                            echo "initialized"
+    local jar_count
+    jar_count=$(find "$dir" -maxdepth 1 -type f -name "*.jar" 2>/dev/null | wc -l)
+    if [[ "$jar_count" -eq 0 ]]; then
+        echo "empty"
+    elif [[ -d "$(sm_dir "$dir")" && -f "${dir}/start.sh" ]]; then
+        echo "initialized"
+    else
+        echo "fresh"
     fi
 }
 
@@ -119,24 +175,163 @@ scan_servers() {
         local state
         state=$(server_state "$subdir")
         [[ "$state" != "empty" ]] && ALL_SERVERS+=("$subdir")
-    done < <(find "$LEAFMC_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+    done < <(find "$SERVERS_DIR" -mindepth 1 -maxdepth 1 -type d \
+        ! -name "backups" ! -name "LOGS" -print0 2>/dev/null | sort -z)
 }
 
 get_ram() {
     local dir="$1"
-    if [[ -f "${dir}/start.sh" ]]; then
+    [[ -f "${dir}/start.sh" ]] && \
         grep -oP '(?<=-Xmx)\d+' "${dir}/start.sh" 2>/dev/null || echo "?"
-    else
-        echo "not set"
+}
+
+# =============================================================================
+#  DOWNLOAD PAGES + BROWSER
+# =============================================================================
+download_url() {
+    local type="$1" version="${2:-}"
+    local vanilla_slug="${version//./-}"
+    case "$type" in
+        leafmc)  echo "https://www.leafmc.one/download" ;;
+        paper)   echo "https://fill-ui.papermc.io/projects/paper" ;;
+        purpur)  echo "https://purpurmc.org/download/purpur/${version}" ;;
+        spigot)  echo "https://www.spigotmc.org/wiki/buildtools/" ;;
+        bukkit)  echo "https://getbukkit.org/download/craftbukkit" ;;
+        fabric)  echo "https://fabricmc.net/use/server/" ;;
+        vanilla) echo "https://www.minecraft.net/en-us/article/minecraft-java-edition-${vanilla_slug}" ;;
+        *)       echo "" ;;
+    esac
+}
+
+open_url() {
+    local url="$1"
+    # Try xdg-open first (respects the user's default browser on any desktop)
+    if command -v xdg-open &>/dev/null; then
+        xdg-open "$url" &>/dev/null & disown
+        return 0
     fi
+    # Fallback: try common browsers in order
+    local browsers=(firefox chromium chromium-browser google-chrome google-chrome-stable
+                    brave-browser microsoft-edge opera vivaldi)
+    for b in "${browsers[@]}"; do
+        if command -v "$b" &>/dev/null; then
+            "$b" "$url" &>/dev/null & disown
+            return 0
+        fi
+    done
+    # No browser found — print the URL
+    echo -e "  ${YELLOW}No browser found. Open this URL manually:${RESET}"
+    echo -e "  ${BOLD}${CYAN}${url}${RESET}"
+    return 1
+}
+
+maybe_open_url() {
+    local url="$1"
+    echo -e "  ${DIM}Download page: ${CYAN}${url}${RESET}"
+    echo
+    local ans
+    read -rp "$(echo -e "${BOLD}Open in browser? [Y/n]: ${RESET}")" ans
+    ans="${ans,,}"   # lowercase
+    if [[ "$ans" != "n" ]]; then
+        open_url "$url" && echo -e "  ${DIM}Browser opened. Come back once the download finishes.${RESET}"
+    fi
+}
+
+# =============================================================================
+#  CRASH WATCHER GENERATION
+#
+#  The watcher runs inside the tmux session as the main process. start.sh runs
+#  in its foreground, so `tmux attach` shows the live MC console as expected.
+#
+#  On exit:
+#   - ServerManager/stopping present → intentional stop, watcher exits cleanly.
+#   - Otherwise → crash: logged to /opt/mcservers/LOGS/YYYY-MM-DD.log, server
+#     is restarted automatically. After 3 crashes in 10 minutes, gives up.
+# =============================================================================
+generate_watcher() {
+    local dir="$1"
+    mkdir -p "$(sm_dir "$dir")"
+
+    # WATCHER_EOF is single-quoted so variables are NOT expanded here —
+    # the watcher defines its own at runtime.
+    cat > "$(sm_file "$dir" "watcher.sh")" <<'WATCHER_EOF'
+#!/usr/bin/env bash
+# Auto-generated by MCServerManager — do not edit manually.
+SERVER_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SERVER_NAME="$(basename "$SERVER_DIR")"
+LOG_BASE="/opt/mcservers/LOGS"
+MAX_CRASHES=3
+WINDOW=600   # 10 minutes in seconds
+
+declare -a CRASH_TIMES=()
+mkdir -p "$LOG_BASE"
+
+_log() {
+    printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" \
+        >> "${LOG_BASE}/$(date +%Y-%m-%d).log"
+}
+
+while true; do
+    # Intentional stop before (re)start?
+    if [[ -f "${SERVER_DIR}/ServerManager/stopping" ]]; then
+        rm -f "${SERVER_DIR}/ServerManager/stopping"
+        exit 0
+    fi
+
+    cd "$SERVER_DIR"
+    START_TIME=$(date +%s)
+    bash ./start.sh
+    EXIT_CODE=$?
+    END_TIME=$(date +%s)
+
+    # Intentional stop during shutdown?
+    if [[ -f "${SERVER_DIR}/ServerManager/stopping" ]]; then
+        rm -f "${SERVER_DIR}/ServerManager/stopping"
+        exit 0
+    fi
+
+    # ── Crash handling ────────────────────────────────────────────────────────
+    NOW=$(date +%s)
+    DURATION=$(( END_TIME - START_TIME ))
+
+    _log "════════════════════════════════════════"
+    _log "CRASH: ${SERVER_NAME}"
+    _log "Ran for: ${DURATION}s  |  Exit code: ${EXIT_CODE}"
+
+    # Drop timestamps outside the window
+    NEW_TIMES=()
+    for t in "${CRASH_TIMES[@]}"; do
+        (( NOW - t < WINDOW )) && NEW_TIMES+=("$t")
+    done
+    CRASH_TIMES=("${NEW_TIMES[@]}" "$NOW")
+
+    if (( ${#CRASH_TIMES[@]} >= MAX_CRASHES )); then
+        _log "TOO MANY CRASHES — ${MAX_CRASHES} in $(( WINDOW / 60 )) min. Giving up."
+        _log "Manual intervention required for: ${SERVER_NAME}"
+        _log "════════════════════════════════════════"
+        echo ""
+        echo "!!! ${SERVER_NAME}: ${MAX_CRASHES} crashes in $(( WINDOW / 60 )) min — not restarting. !!!"
+        echo "Check logs: ${LOG_BASE}/$(date +%Y-%m-%d).log"
+        exit 1
+    fi
+
+    _log "Restarting ${SERVER_NAME} (crash ${#CRASH_TIMES[@]}/${MAX_CRASHES})..."
+    _log "════════════════════════════════════════"
+    echo ""
+    echo ">>> ${SERVER_NAME} crashed. Restarting in 5s... (${#CRASH_TIMES[@]}/${MAX_CRASHES} in $(( WINDOW / 60 ))min window)"
+    sleep 5
+done
+WATCHER_EOF
+
+    chmod +x "$(sm_file "$dir" "watcher.sh")"
 }
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 print_banner() {
     clear
     sep
-    echo -e "  ${BOLD}${GREEN}LeafMC Server Manager${RESET}"
-    echo -e "  ${DIM}${LEAFMC_DIR}${RESET}"
+    echo -e "  ${BOLD}${GREEN}MCServerManager${RESET}"
+    echo -e "  ${DIM}${SERVERS_DIR}${RESET}"
     sep
     echo
 }
@@ -146,19 +341,18 @@ print_banner() {
 # =============================================================================
 backup_server() {
     local dir="$1"
-    local version
-    version=$(basename "$dir")
-    local backup_dir="${BACKUP_BASE}/${version}"
+    local name
+    name=$(server_name "$dir")
+    local backup_dir="${BACKUP_BASE}/${name}"
     mkdir -p "$backup_dir"
 
-    local timestamp
+    local timestamp archive
     timestamp=$(date +%Y-%m-%d_%H-%M-%S)
-    local archive="${backup_dir}/${version}_${timestamp}.tar.gz"
+    archive="${backup_dir}/${name}_${timestamp}.tar.gz"
 
     echo
-    info "Backing up ${BOLD}${version}${RESET}..."
+    info "Backing up ${BOLD}${name}${RESET}..."
 
-    # If server is running and RCON available, pause autosave for a clean backup
     local rcon_used=false
     if server_running "$dir" && rcon_available "$dir"; then
         info "Server is live — pausing autosave for a clean backup..."
@@ -170,21 +364,33 @@ backup_server() {
     elif server_running "$dir"; then
         warn "Server is running but RCON is not configured."
         warn "Backup may catch mid-write world files. Proceed anyway?"
+        local confirm
         read -rp "$(echo -e "${BOLD}[y/N]: ${RESET}")" confirm
         [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
     fi
 
-    # Exclude the backups directory itself and logs
     tar -czf "$archive" \
         --exclude="${BACKUP_BASE}" \
         --exclude="${dir}/logs" \
         -C "$(dirname "$dir")" \
         "$(basename "$dir")" 2>/dev/null || true
 
-    # Re-enable autosave
     if [[ "$rcon_used" == true ]]; then
         rcon_send "$dir" "save-on" &>/dev/null || true
         rcon_send "$dir" "say [Backup] Backup complete, autosave resumed." &>/dev/null || true
+    fi
+
+    # ── Prune old backups ─────────────────────────────────────────────────────
+    local keep
+    keep=$(read_meta "$dir" "backup_keep")
+    keep="${keep:-5}"
+    if [[ "$keep" =~ ^[0-9]+$ ]] && (( keep > 0 )); then
+        local count
+        count=$(ls -t "${backup_dir}"/*.tar.gz 2>/dev/null | wc -l)
+        if (( count > keep )); then
+            ls -t "${backup_dir}"/*.tar.gz | tail -n "+$(( keep + 1 ))" | xargs rm -f
+            info "Pruned old backups (keeping last ${keep})."
+        fi
     fi
 
     local size
@@ -194,24 +400,67 @@ backup_server() {
     read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
 }
 
+schedule_backup() {
+    local dir="$1"
+    local name
+    name=$(server_name "$dir")
+
+    print_banner
+    echo -e "  ${BOLD}Schedule automatic backups — ${name}${RESET}"
+    echo
+    sep
+    echo -e "  ${BOLD}${CYAN}[1]${RESET}  Every 6 hours"
+    echo -e "  ${BOLD}${CYAN}[2]${RESET}  Every 12 hours"
+    echo -e "  ${BOLD}${CYAN}[3]${RESET}  Daily at 3 AM"
+    echo -e "  ${BOLD}${CYAN}[4]${RESET}  Weekly (Sunday at 3 AM)"
+    echo -e "  ${BOLD}${CYAN}[5]${RESET}  Remove scheduled backup for this server"
+    echo -e "  ${BOLD}${CYAN}[b]${RESET}  Back"
+    echo
+
+    local choice
+    read -rp "$(echo -e "${BOLD}Choose: ${RESET}")" choice
+
+    local cron_expr=""
+    case "$choice" in
+        1) cron_expr="0 */6 * * *" ;;
+        2) cron_expr="0 */12 * * *" ;;
+        3) cron_expr="0 3 * * *" ;;
+        4) cron_expr="0 3 * * 0" ;;
+        5)
+            crontab -l 2>/dev/null | grep -v "# mcserver-backup-${name}$" | crontab - 2>/dev/null || true
+            success "Scheduled backup removed for '${name}'."
+            sleep 1; return
+            ;;
+        b|B|"") return ;;
+        *) warn "Invalid choice."; sleep 1; return ;;
+    esac
+
+    local cron_cmd="${cron_expr} bash ${SCRIPT_PATH} --backup ${name} # mcserver-backup-${name}"
+    ( crontab -l 2>/dev/null | grep -v "# mcserver-backup-${name}$"; echo "$cron_cmd" ) | crontab -
+    success "Backup scheduled: ${DIM}${cron_expr}${RESET}"
+    echo
+    read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+}
+
 list_backups() {
     local dir="$1"
-    local version
-    version=$(basename "$dir")
-    local backup_dir="${BACKUP_BASE}/${version}"
+    local name
+    name=$(server_name "$dir")
+    local backup_dir="${BACKUP_BASE}/${name}"
 
     if [[ ! -d "$backup_dir" ]] || [[ -z "$(ls -A "$backup_dir" 2>/dev/null)" ]]; then
-        echo
-        warn "No backups found for ${version}."
-        echo
+        echo; warn "No backups found for '${name}'."; echo
         read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
         return
     fi
 
     mapfile -t BACKUPS < <(ls -t "${backup_dir}"/*.tar.gz 2>/dev/null)
+    local keep
+    keep=$(read_meta "$dir" "backup_keep")
+    keep="${keep:-5}"
 
     print_banner
-    echo -e "  ${BOLD}Backups for ${version}:${RESET}"
+    echo -e "  ${BOLD}Backups for ${name}:${RESET}"
     sep
     for i in "${!BACKUPS[@]}"; do
         local bname size
@@ -223,29 +472,31 @@ list_backups() {
     sep
     echo -e "  ${BOLD}${CYAN}[r]${RESET}  Restore a backup"
     echo -e "  ${BOLD}${CYAN}[d]${RESET}  Delete a backup"
+    echo -e "  ${BOLD}${CYAN}[k]${RESET}  Change retention  ${DIM}(currently keeping ${keep})${RESET}"
+    echo -e "  ${BOLD}${CYAN}[s]${RESET}  Schedule automatic backups"
     echo -e "  ${BOLD}${CYAN}[b]${RESET}  Back"
     echo
 
     local choice
     read -rp "$(echo -e "${BOLD}Choose: ${RESET}")" choice
+    echo
 
     case "$choice" in
         r|R)
-            echo
             local idx
-            read -rp "$(echo -e "${BOLD}Enter backup number to restore: ${RESET}")" idx
+            read -rp "$(echo -e "${BOLD}Backup number to restore: ${RESET}")" idx
             if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#BACKUPS[@]} )); then
                 local chosen="${BACKUPS[$((idx-1))]}"
                 echo
-                warn "This will OVERWRITE the current server files with the backup."
-                warn "The current state will be lost. Are you sure?"
+                warn "This will OVERWRITE the current server with the backup."
+                warn "World data, plugins, and configs will be replaced."
                 local confirm
                 read -rp "$(echo -e "${RED}${BOLD}Type 'yes' to confirm: ${RESET}")" confirm
                 if [[ "$confirm" == "yes" ]]; then
                     if server_running "$dir"; then
                         err "Stop the server before restoring a backup."
                     else
-                        info "Restoring ${BOLD}$(basename "$chosen")${RESET}..."
+                        info "Restoring $(basename "$chosen")..."
                         rm -rf "$dir"
                         tar -xzf "$chosen" -C "$(dirname "$dir")"
                         success "Restore complete."
@@ -258,22 +509,125 @@ list_backups() {
             fi
             ;;
         d|D)
-            echo
             local idx
-            read -rp "$(echo -e "${BOLD}Enter backup number to delete: ${RESET}")" idx
+            read -rp "$(echo -e "${BOLD}Backup number to delete: ${RESET}")" idx
             if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#BACKUPS[@]} )); then
-                local chosen="${BACKUPS[$((idx-1))]}"
-                rm -f "$chosen"
-                success "Deleted $(basename "$chosen")."
+                rm -f "${BACKUPS[$((idx-1))]}"
+                success "Deleted $(basename "${BACKUPS[$((idx-1))]}")."
             else
                 warn "Invalid selection."
             fi
             ;;
+        k|K)
+            local new_keep
+            read -rp "$(echo -e "${BOLD}How many backups to keep (currently ${keep}): ${RESET}")" new_keep
+            if [[ "$new_keep" =~ ^[0-9]+$ ]] && (( new_keep >= 1 )); then
+                write_meta "$dir" "backup_keep" "$new_keep"
+                success "Retention set to ${new_keep} backups."
+            else
+                warn "Invalid number."
+            fi
+            ;;
+        s|S) schedule_backup "$dir" ;;
         b|B|"") return ;;
         *) warn "Invalid choice." ;;
     esac
+
     echo
     read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+}
+
+# =============================================================================
+#  RESOURCE MONITOR
+# =============================================================================
+resource_monitor() {
+    local dir="$1"
+    local name ram
+    name=$(server_name "$dir")
+    ram=$(get_ram "$dir")
+
+    echo
+    info "Monitoring ${BOLD}${name}${RESET} — press Ctrl+C to stop"
+    echo
+    printf "  %-10s  %-20s  %s\n" "CPU %" "RAM used / allocated" "RAM %"
+    sep
+
+    while true; do
+        if ! server_running "$dir"; then
+            echo; warn "Server stopped."; break
+        fi
+
+        local pid cpu mem_mb ram_mb mem_pct
+        pid=$(get_server_pid "$dir")
+
+        if [[ -z "$pid" ]]; then
+            printf "\r  ${DIM}Waiting for Java process...${RESET}                    "
+        else
+            local usage
+            usage=$(get_resource_usage "$pid")
+            cpu=$(echo "$usage" | cut -d' ' -f1)
+            mem_mb=$(echo "$usage" | cut -d' ' -f2)
+            ram_mb=$(( ${ram:-0} * 1024 ))
+            if [[ "$ram_mb" -gt 0 ]]; then
+                mem_pct=$(( mem_mb * 100 / ram_mb ))
+            else
+                mem_pct="?"
+            fi
+            printf "\r  %-10s  %-20s  %s%%        " \
+                "${cpu}%" \
+                "${mem_mb}MB / ${ram}G" \
+                "$mem_pct"
+        fi
+        sleep 2
+    done
+
+    echo
+    read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+}
+
+# =============================================================================
+#  CRASH LOGS
+# =============================================================================
+view_crash_logs() {
+    print_banner
+    echo -e "  ${BOLD}Crash Logs${RESET}"
+    echo -e "  ${DIM}${LOG_BASE}${RESET}"
+    echo
+    sep
+
+    mkdir -p "$LOG_BASE"
+    mapfile -t LOGS < <(ls -t "${LOG_BASE}"/*.log 2>/dev/null)
+
+    if [[ "${#LOGS[@]}" -eq 0 ]]; then
+        echo
+        success "No crash logs found — servers have been well-behaved!"
+        echo
+        read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+        return
+    fi
+
+    for i in "${!LOGS[@]}"; do
+        local lname size
+        lname=$(basename "${LOGS[$i]}")
+        size=$(du -sh "${LOGS[$i]}" 2>/dev/null | cut -f1)
+        echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${lname}  ${DIM}(${size})${RESET}"
+    done
+    echo
+    sep
+    echo -e "  ${BOLD}${CYAN}[b]${RESET}  Back"
+    echo
+
+    local choice
+    read -rp "$(echo -e "${BOLD}Choose a log to view: ${RESET}")" choice
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#LOGS[@]} )); then
+        echo
+        sep
+        cat "${LOGS[$((choice-1))]}"
+        sep
+        echo
+        read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+    fi
 }
 
 # =============================================================================
@@ -281,14 +635,18 @@ list_backups() {
 # =============================================================================
 manage_server() {
     local dir="$1"
-    local version
-    version=$(basename "$dir")
 
     while true; do
         print_banner
-        local state ram running_badge
+
+        local name type version state ram running_badge
+        name=$(server_name "$dir")
+        type=$(server_type "$dir")
+        version=$(server_version "$dir")
         state=$(server_state "$dir")
         ram=$(get_ram "$dir")
+        [[ -z "$type" ]]    && type="unknown"
+        [[ -z "$version" ]] && version="unknown"
 
         if server_running "$dir"; then
             running_badge="${GREEN}${BOLD}● RUNNING${RESET}"
@@ -296,12 +654,10 @@ manage_server() {
             running_badge="${DIM}○ stopped${RESET}"
         fi
 
-        echo -e "  ${BOLD}Managing:${RESET} ${GREEN}${BOLD}${version}${RESET}  ${running_badge}"
-        echo -e "  ${DIM}Path:  ${dir}${RESET}"
-        [[ "$state" == "initialized" ]] && echo -e "  ${DIM}RAM:   ${ram}G${RESET}"
+        echo -e "  ${BOLD}Managing:${RESET} ${GREEN}${BOLD}${name}${RESET}  ${running_badge}"
+        echo -e "  ${DIM}Type: ${type}  |  Version: ${version}  |  Path: ${dir}${RESET}"
+        [[ "$state" == "initialized" ]] && echo -e "  ${DIM}RAM: ${ram}G${RESET}"
         echo
-        sep
-        echo -e "  ${BOLD}Options:${RESET}"
         sep
 
         local options=()
@@ -314,68 +670,67 @@ manage_server() {
             if server_running "$dir"; then
                 options+=("Attach to console")
                 options+=("Send command to server")
+                options+=("Resource monitor")
                 options+=("Stop server gracefully")
             else
                 options+=("Start server")
             fi
             options+=("Backup server")
-            options+=("View / restore backups")
+            options+=("View / restore / schedule backups")
             options+=("Edit server.properties")
-            options+=("Change RAM allocation  (currently ${ram}G)")
+            options+=("Change RAM allocation")
         fi
 
-        options+=("Rename server directory")
+        options+=("Rename server")
         options+=("Delete server")
         options+=("Back to main menu")
 
         for i in "${!options[@]}"; do
             local label="${options[$i]}"
-            if [[ "$label" == "Change RAM allocation"* ]]; then
-                echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  Change RAM allocation  ${DIM}(currently ${ram}G)${RESET}"
-            elif [[ "$label" == "Attach to console" ]]; then
-                echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${GREEN}${label}${RESET}"
-            elif [[ "$label" == "Stop server gracefully" ]]; then
-                echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${YELLOW}${label}${RESET}"
-            elif [[ "$label" == "Delete server" ]]; then
-                echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${RED}${label}${RESET}"
-            else
-                echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${label}"
-            fi
+            case "$label" in
+                "Attach to console")
+                    echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${GREEN}${label}${RESET}" ;;
+                "Stop server gracefully")
+                    echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${YELLOW}${label}${RESET}" ;;
+                "Delete server")
+                    echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${RED}${label}${RESET}" ;;
+                "Change RAM allocation")
+                    echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  Change RAM allocation  ${DIM}(currently ${ram}G)${RESET}" ;;
+                *)
+                    echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${label}" ;;
+            esac
         done
         echo
 
         local choice
-        read -rp "$(echo -e "${BOLD}Choose an option: ${RESET}")" choice
+        read -rp "$(echo -e "${BOLD}Choose: ${RESET}")" choice
 
         if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#options[@]} )); then
-            warn "Invalid selection."
-            sleep 1
-            continue
+            warn "Invalid selection."; sleep 1; continue
         fi
 
         local selected="${options[$((choice-1))]}"
-        selected="${selected%%  (*}"
 
         case "$selected" in
 
             "Run first-time setup")
-                run_first_time_setup "$dir"
-                return
-                ;;
+                run_first_time_setup "$dir"; return ;;
 
             "Start server")
-                local sess
+                local sess watcher
                 sess=$(session_name "$dir")
+                watcher=$(sm_file "$dir" "watcher.sh")
+                [[ ! -f "$watcher" ]] && generate_watcher "$dir"
                 echo
-                info "Starting LeafMC ${version} in tmux session '${sess}'..."
-                tmux new-session -d -s "$sess" -c "$dir" "bash ./start.sh"
-                sleep 5
+                info "Starting ${name} in tmux session '${sess}'..."
+                tmux new-session -d -s "$sess" -c "$dir" "bash ${watcher}"
+                sleep 3
                 if server_running "$dir"; then
-                    success "Server started! Session: ${CYAN}${sess}${RESET}"
-                    echo -e "  ${DIM}Attach with: tmux attach -t ${sess}${RESET}"
-                    echo -e "  ${DIM}Detach with: Ctrl+B then D${RESET}"
+                    success "Server started!"
+                    echo -e "  ${DIM}Attach:  tmux attach -t ${sess}${RESET}"
+                    echo -e "  ${DIM}Detach:  Ctrl+B then D${RESET}"
                 else
-                    warn "Session may have exited immediately. Check logs in ${dir}/logs/"
+                    warn "Session exited immediately. Check ${dir}/logs/ for errors."
                 fi
                 echo
                 read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
@@ -386,22 +741,18 @@ manage_server() {
                 sess=$(session_name "$dir")
                 echo
                 info "Attaching to ${BOLD}${sess}${RESET}..."
-                echo -e "  ${DIM}Detach with Ctrl+B then D to return here.${RESET}"
-                echo
+                echo -e "  ${DIM}Detach with Ctrl+B then D.${RESET}"
                 sleep 1
                 tmux attach-session -t "$sess" || warn "Session not found."
                 ;;
 
             "Send command to server")
+                echo
                 if ! rcon_available "$dir"; then
-                    echo
-                    warn "mcrcon is not installed or RCON is not configured."
-                    warn "Install mcrcon with: paru -S mcrcon"
+                    warn "mcrcon not installed or RCON not configured for this server."
                 else
-                    echo
-                    local cmd
+                    local cmd result
                     read -rp "$(echo -e "${BOLD}Command to send: ${RESET}")" cmd
-                    local result
                     result=$(rcon_send "$dir" "$cmd" 2>&1) || true
                     echo
                     if [[ -n "$result" ]]; then
@@ -415,8 +766,12 @@ manage_server() {
                 read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
                 ;;
 
+            "Resource monitor")
+                resource_monitor "$dir" ;;
+
             "Stop server gracefully")
                 echo
+                touch "$(sm_file "$dir" "stopping")"
                 if rcon_available "$dir"; then
                     info "Sending stop via RCON..."
                     rcon_send "$dir" "say Server is stopping in 5 seconds..." &>/dev/null || true
@@ -430,28 +785,23 @@ manage_server() {
                     info "Sending stop via tmux (RCON not available)..."
                     tmux send-keys -t "$sess" "stop" Enter 2>/dev/null || warn "Could not send stop command."
                     sleep 3
-                    success "Stop command sent to tmux session."
+                    success "Stop command sent."
                 fi
                 read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
                 ;;
 
             "Backup server")
-                backup_server "$dir"
-                ;;
+                backup_server "$dir" ;;
 
-            "View / restore backups")
-                list_backups "$dir"
-                ;;
+            "View / restore / schedule backups")
+                list_backups "$dir" ;;
 
             "Edit server.properties")
                 local props="${dir}/server.properties"
                 if [[ -f "$props" ]]; then
                     nano "$props"
-                    echo
-                    success "server.properties saved."
-                    if server_running "$dir"; then
-                        warn "Restart the server to apply property changes."
-                    fi
+                    echo; success "server.properties saved."
+                    server_running "$dir" && warn "Restart the server to apply changes."
                 else
                     warn "server.properties not found. Run first-time setup first."
                 fi
@@ -460,83 +810,71 @@ manage_server() {
 
             "Change RAM allocation")
                 echo
-                local new_ram
+                local new_ram jar_name
                 while true; do
                     read -rp "$(echo -e "${BOLD}New RAM in GB (currently ${ram}G): ${RESET}")" new_ram
-                    if [[ "$new_ram" =~ ^[0-9]+$ ]] && (( new_ram >= 1 )); then break
-                    else warn "Please enter a whole number (e.g. 4)."; fi
+                    [[ "$new_ram" =~ ^[0-9]+$ ]] && (( new_ram >= 1 )) && break
+                    warn "Please enter a whole number (e.g. 4)."
                 done
-                local jar_name
                 jar_name=$(basename "$(find "$dir" -maxdepth 1 -name "*.jar" | head -n1)")
                 cat > "${dir}/start.sh" <<EOF
 #!/usr/bin/env bash
-# LeafMC ${version} — start script
-# Generated by server.sh
-
+# MCServerManager — start script for ${name}
 cd "\$(dirname "\$0")"
 java -Xmx${new_ram}G -Xms${new_ram}G -jar ${jar_name} nogui
 EOF
                 chmod +x "${dir}/start.sh"
                 success "RAM updated to ${new_ram}G."
-                if server_running "$dir"; then
-                    warn "Restart the server to apply the new RAM setting."
-                fi
+                server_running "$dir" && warn "Restart the server to apply."
                 sleep 1
                 ;;
 
-            "Rename server directory")
+            "Rename server")
                 echo
                 if server_running "$dir"; then
-                    warn "Stop the server before renaming."
-                    sleep 2
-                    continue
+                    warn "Stop the server before renaming."; sleep 2; continue
                 fi
                 local new_name
                 while true; do
-                    read -rp "$(echo -e "${BOLD}New name for '${version}': ${RESET}")" new_name
+                    read -rp "$(echo -e "${BOLD}New name for '${name}': ${RESET}")" new_name
                     new_name="${new_name// /-}"
                     if [[ -z "$new_name" ]]; then
                         warn "Name cannot be empty."
-                    elif [[ -e "${LEAFMC_DIR}/${new_name}" ]]; then
+                    elif [[ -e "${SERVERS_DIR}/${new_name}" ]]; then
                         warn "A directory named '${new_name}' already exists."
                     else
                         break
                     fi
                 done
-                local new_dir="${LEAFMC_DIR}/${new_name}"
+                local new_dir="${SERVERS_DIR}/${new_name}"
                 mv "$dir" "$new_dir"
-                success "Renamed '${version}' → '${new_name}'"
+                generate_watcher "$new_dir"
+                success "Renamed '${name}' → '${new_name}'"
                 dir="$new_dir"
-                version="$new_name"
                 sleep 1
                 ;;
 
             "Delete server")
                 echo
                 if server_running "$dir"; then
-                    warn "Stop the server before deleting."
-                    sleep 2
-                    continue
+                    warn "Stop the server before deleting."; sleep 2; continue
                 fi
-                warn "This will permanently delete ${BOLD}${version}${RESET} and ALL its files."
+                warn "This will permanently delete ${BOLD}${name}${RESET} and ALL its files."
                 warn "World data, plugins, configs — everything."
                 echo
                 local confirm
                 read -rp "$(echo -e "${RED}${BOLD}Type the server name to confirm: ${RESET}")" confirm
-                if [[ "$confirm" == "$version" ]]; then
+                if [[ "$confirm" == "$name" ]]; then
                     rm -rf "$dir"
-                    success "Server '${version}' deleted."
-                    sleep 1
-                    return
+                    success "Server '${name}' deleted."
+                    sleep 1; return
                 else
                     warn "Name didn't match. Deletion cancelled."
                     sleep 1
                 fi
                 ;;
 
-            "Back to main menu")
-                return
-                ;;
+            "Back to main menu") return ;;
         esac
     done
 }
@@ -546,24 +884,24 @@ EOF
 # =============================================================================
 run_first_time_setup() {
     local dir="$1"
-    local version
-    version=$(basename "$dir")
-    local jar_name
+    local name type jar_name
+    name=$(server_name "$dir")
+    type=$(server_type "$dir")
+    [[ -z "$type" ]] && type="unknown"
     jar_name=$(basename "$(find "$dir" -maxdepth 1 -name "*.jar" | head -n1)")
 
     echo
     sep
-    info "Running LeafMC ${version} for the first time..."
+    info "Running first-time setup for ${BOLD}${name}${RESET} (${type})..."
     echo -e "  ${YELLOW}(The server will stop after generating eula.txt)${RESET}"
     echo
 
     cd "$dir"
     java -Xmx2G -Xms2G -jar "$jar_name" nogui || true
-
     echo
     info "First run complete."
 
-    # Accept EULA
+    # ── Accept EULA ───────────────────────────────────────────────────────────
     if [[ -f "${dir}/eula.txt" ]]; then
         sed -i 's/eula=false/eula=true/' "${dir}/eula.txt"
         success "EULA accepted."
@@ -571,49 +909,51 @@ run_first_time_setup() {
         warn "eula.txt not found — you may need to accept it manually."
     fi
 
-    # Configure RCON in server.properties
+    # ── Configure RCON ────────────────────────────────────────────────────────
     if [[ -f "${dir}/server.properties" ]] && command -v mcrcon &>/dev/null; then
         info "Configuring RCON..."
         local rcon_pass rcon_port_num
         rcon_pass=$(openssl rand -hex 12)
         rcon_port_num=25575
-
-        sed -i "s/^enable-rcon=.*/enable-rcon=true/"         "${dir}/server.properties"
-        sed -i "s/^rcon.port=.*/rcon.port=${rcon_port_num}/" "${dir}/server.properties"
+        sed -i "s/^enable-rcon=.*/enable-rcon=true/"             "${dir}/server.properties"
+        sed -i "s/^rcon.port=.*/rcon.port=${rcon_port_num}/"     "${dir}/server.properties"
         sed -i "s/^rcon.password=.*/rcon.password=${rcon_pass}/" "${dir}/server.properties"
-
-        # Write to .leafmc.conf
         write_conf "$dir" "rcon_password" "$rcon_pass"
         write_conf "$dir" "rcon_port"     "$rcon_port_num"
-        success "RCON configured (password stored in ${dir}/.leafmc.conf)."
+        success "RCON configured (password stored in ${dir}/.mcserver.conf)."
     else
-        warn "Skipping RCON setup (mcrcon not installed or server.properties missing)."
+        warn "Skipping RCON setup (mcrcon not installed or server.properties not found)."
     fi
 
+    # ── RAM allocation ────────────────────────────────────────────────────────
     echo
     sep
     local ram_gb
     while true; do
         read -rp "$(echo -e "${BOLD}How much RAM (in GB) to dedicate to this server? ${RESET}")" ram_gb
-        if [[ "$ram_gb" =~ ^[0-9]+$ ]] && (( ram_gb >= 1 )); then break
-        else warn "Please enter a whole number (e.g. 4)."; fi
+        [[ "$ram_gb" =~ ^[0-9]+$ ]] && (( ram_gb >= 1 )) && break
+        warn "Please enter a whole number (e.g. 4)."
     done
 
     cat > "${dir}/start.sh" <<EOF
 #!/usr/bin/env bash
-# LeafMC ${version} — start script
-# Generated by server.sh
-
+# MCServerManager — start script for ${name}
 cd "\$(dirname "\$0")"
 java -Xmx${ram_gb}G -Xms${ram_gb}G -jar ${jar_name} nogui
 EOF
     chmod +x "${dir}/start.sh"
 
+    # ── Generate crash watcher ────────────────────────────────────────────────
+    generate_watcher "$dir"
+
+    # ── Default backup retention ──────────────────────────────────────────────
+    [[ -z "$(read_meta "$dir" "backup_keep")" ]] && write_meta "$dir" "backup_keep" "5"
+
     echo
     success "start.sh created with ${ram_gb}G RAM."
     sep
-    echo -e "  ${BOLD}${GREEN}Setup complete!${RESET}"
-    echo -e "  Start your server from the main menu."
+    echo -e "  ${BOLD}${GREEN}Setup complete for ${name}!${RESET}"
+    echo -e "  Start the server from the main menu."
     sep
     echo
     read -rp "$(echo -e "${BOLD}Press Enter to return to the main menu...${RESET}")"
@@ -624,57 +964,163 @@ EOF
 # =============================================================================
 add_new_server() {
     print_banner
-    echo -e "  ${BOLD}Add a new LeafMC server${RESET}"
+    echo -e "  ${BOLD}Add a new server${RESET}"
     echo
     sep
     echo
-    echo -e "  Download LeafMC from ${CYAN}https://www.leafmc.one/download${RESET}"
+
+    # ── Server name ───────────────────────────────────────────────────────────
+    local srv_name
+    while true; do
+        read -rp "$(echo -e "${BOLD}Server name (e.g. survival, creative, lobby): ${RESET}")" srv_name
+        srv_name="${srv_name// /-}"
+        if [[ -z "$srv_name" ]]; then
+            warn "Name cannot be empty."
+        elif [[ -e "${SERVERS_DIR}/${srv_name}" ]]; then
+            warn "A server named '${srv_name}' already exists."
+        else
+            break
+        fi
+        echo
+    done
+
+    # ── Minecraft version ─────────────────────────────────────────────────────
     echo
-    read -rp "$(echo -e "${BOLD}Press Enter to open the download page in Firefox...${RESET}")"
-    firefox "https://www.leafmc.one/download" &>/dev/null &
-    disown
+    local srv_version
+    while true; do
+        read -rp "$(echo -e "${BOLD}Minecraft version (e.g. 1.21.4): ${RESET}")" srv_version
+        [[ "$srv_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] && break
+        warn "Doesn't look like a valid version (expected e.g. 1.21.4)."
+        echo
+    done
+
+    # ── Server software ───────────────────────────────────────────────────────
     echo
-    info "Firefox opened. Come back once the download finishes."
+    sep
+    echo -e "  ${BOLD}Server software:${RESET}"
+    sep
+    echo -e "  ${BOLD}${CYAN}[1]${RESET}  LeafMC   ${DIM}— optimised fork of Paper${RESET}"
+    echo -e "  ${BOLD}${CYAN}[2]${RESET}  Paper    ${DIM}— most popular high-performance fork${RESET}"
+    echo -e "  ${BOLD}${CYAN}[3]${RESET}  Purpur   ${DIM}— Paper fork with extra configurability${RESET}"
+    echo -e "  ${BOLD}${CYAN}[4]${RESET}  Spigot   ${DIM}— classic, requires BuildTools${RESET}"
+    echo -e "  ${BOLD}${CYAN}[5]${RESET}  Bukkit   ${DIM}— original plugin platform${RESET}"
+    echo -e "  ${BOLD}${CYAN}[6]${RESET}  Fabric   ${DIM}— lightweight mod loader${RESET}"
+    echo -e "  ${BOLD}${CYAN}[7]${RESET}  Vanilla  ${DIM}— official Mojang server${RESET}"
+    echo
+
+    local type_choice srv_type
+    while true; do
+        read -rp "$(echo -e "${BOLD}Choose [1–7]: ${RESET}")" type_choice
+        case "$type_choice" in
+            1) srv_type="leafmc";  break ;;
+            2) srv_type="paper";   break ;;
+            3) srv_type="purpur";  break ;;
+            4) srv_type="spigot";  break ;;
+            5) srv_type="bukkit";  break ;;
+            6) srv_type="fabric";  break ;;
+            7) srv_type="vanilla"; break ;;
+            *) warn "Please pick 1–7." ;;
+        esac
+    done
+
+    # ── Open download page ────────────────────────────────────────────────────
+    local dest_dir="${SERVERS_DIR}/${srv_name}"
+    mkdir -p "$dest_dir"
+    mkdir -p "$(sm_dir "$dest_dir")"
+
+    echo
+    local url
+    url=$(download_url "$srv_type" "$srv_version")
+    maybe_open_url "$url"
     echo
 
     local jar_src
     while true; do
-        read -rp "$(echo -e "${BOLD}Enter the full path to the downloaded JAR: ${RESET}")" jar_src
+        read -rp "$(echo -e "${BOLD}Full path to the downloaded JAR: ${RESET}")" jar_src
         jar_src="${jar_src//\'/}"
         jar_src="${jar_src//\"/}"
         jar_src="${jar_src/#\~/$HOME}"
-        if [[ -f "$jar_src" ]]; then break
-        else warn "File not found: ${jar_src}"; echo; fi
+        [[ -f "$jar_src" ]] && break
+        warn "File not found: ${jar_src}"
+        echo
     done
 
-    local mc_version
-    while true; do
-        read -rp "$(echo -e "${BOLD}Enter the Minecraft version (e.g. 1.21.1): ${RESET}")" mc_version
-        if [[ "$mc_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-            if [[ -d "${LEAFMC_DIR}/${mc_version}" ]]; then
-                warn "A server named '${mc_version}' already exists."
-            else
-                break
-            fi
-        else
-            warn "Doesn't look like a valid version (expected e.g. 1.21.1)."
-            echo
-        fi
-    done
+    mv "$jar_src" "${dest_dir}/server.jar"
+    success "JAR moved to ${CYAN}${dest_dir}/server.jar${RESET}"
 
-    local dest_dir="${LEAFMC_DIR}/${mc_version}"
-    mkdir -p "$dest_dir"
-    mv "$jar_src" "${dest_dir}/leaf.jar"
-    success "Moved JAR to ${CYAN}${dest_dir}/leaf.jar${RESET}"
+    write_meta "$dest_dir" "type"        "$srv_type"
+    write_meta "$dest_dir" "version"     "$srv_version"
+    write_meta "$dest_dir" "backup_keep" "5"
+
     echo
-
     run_first_time_setup "$dest_dir"
 }
 
 # =============================================================================
-#  MAIN
+#  BULK ACTIONS
+# =============================================================================
+start_all_servers() {
+    echo
+    local started=0
+    for dir in "${ALL_SERVERS[@]}"; do
+        if ! server_running "$dir" && [[ "$(server_state "$dir")" == "initialized" ]]; then
+            local name sess watcher
+            name=$(server_name "$dir")
+            sess=$(session_name "$dir")
+            watcher=$(sm_file "$dir" "watcher.sh")
+            [[ ! -f "$watcher" ]] && generate_watcher "$dir"
+            tmux new-session -d -s "$sess" -c "$dir" "bash ${watcher}"
+            success "Started: ${name}"
+            (( started++ )) || true
+        fi
+    done
+    [[ "$started" -eq 0 ]] && info "No stopped initialized servers found."
+    echo
+    read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+}
+
+stop_all_servers() {
+    echo
+    local stopped=0
+    for dir in "${ALL_SERVERS[@]}"; do
+        if server_running "$dir"; then
+            local name sess
+            name=$(server_name "$dir")
+            sess=$(session_name "$dir")
+            touch "$(sm_file "$dir" "stopping")"
+            if rcon_available "$dir"; then
+                rcon_send "$dir" "stop" &>/dev/null || true
+            else
+                tmux send-keys -t "$sess" "stop" Enter 2>/dev/null || true
+            fi
+            success "Stop sent to: ${name}"
+            (( stopped++ )) || true
+        fi
+    done
+    [[ "$stopped" -eq 0 ]] && info "No servers are currently running."
+    echo
+    read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+}
+
+# =============================================================================
+#  CLI BACKUP MODE (called by cron: server.sh --backup <name>)
+# =============================================================================
+if [[ "$_CLI_BACKUP" -eq 1 ]]; then
+    if [[ ! -d "$_CLI_DIR" ]]; then
+        echo "Server '${_CLI_NAME}' not found at ${_CLI_DIR}." >&2
+        exit 1
+    fi
+    backup_server "$_CLI_DIR"
+    exit 0
+fi
+
+# =============================================================================
+#  MAIN LOOP
 # =============================================================================
 check_deps
+mkdir -p "$SERVERS_DIR" "$BACKUP_BASE" "$LOG_BASE"
+
+declare -a ALL_SERVERS=()
 
 while true; do
     print_banner
@@ -684,61 +1130,79 @@ while true; do
         echo -e "  ${BOLD}Your servers:${RESET}"
         sep
         for i in "${!ALL_SERVERS[@]}"; do
-            local_dir="${ALL_SERVERS[$i]}"
-            ver=$(basename "$local_dir")
-            state=$(server_state "$local_dir")
-            ram=$(get_ram "$local_dir")
+            _dir="${ALL_SERVERS[$i]}"
+            _name=$(server_name "$_dir")
+            _type=$(server_type "$_dir")
+            _version=$(server_version "$_dir")
+            _state=$(server_state "$_dir")
+            _ram=$(get_ram "$_dir")
+            [[ -z "$_type" ]]    && _type="?"
+            [[ -z "$_version" ]] && _version="?"
 
-        run_dot=""
-            if server_running "$local_dir"; then
-                run_dot="${GREEN}●${RESET}"
+            if server_running "$_dir"; then
+                _dot="${GREEN}●${RESET}"
             else
-                run_dot="${DIM}○${RESET}"
+                _dot="${DIM}○${RESET}"
             fi
 
-            case "$state" in
-                fresh)       badge="${YELLOW}needs setup${RESET}" ;;
-                initialized) badge="${GREEN}ready${RESET}  ·  RAM: ${BOLD}${ram}G${RESET}" ;;
-                *)           badge="${DIM}unknown${RESET}" ;;
+            case "$_state" in
+                fresh)       _badge="${YELLOW}needs setup${RESET}" ;;
+                initialized) _badge="${GREEN}ready${RESET}  ·  ${_type} ${_version}  ·  RAM: ${BOLD}${_ram}G${RESET}" ;;
+                *)           _badge="${DIM}unknown${RESET}" ;;
             esac
 
-            echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${run_dot}  ${BOLD}${ver}${RESET}  ${DIM}|${RESET}  ${badge}"
+            echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${_dot}  ${BOLD}${_name}${RESET}  ${DIM}|${RESET}  ${_badge}"
         done
         echo
         sep
-        ADD_IDX=$(( ${#ALL_SERVERS[@]} + 1 ))
-        QUIT_IDX=$(( ${#ALL_SERVERS[@]} + 2 ))
+
+        local _n="${#ALL_SERVERS[@]}"
+        IDX_STARTALL=$(( _n + 1 ))
+        IDX_STOPALL=$(( _n + 2 ))
+        IDX_LOGS=$(( _n + 3 ))
+        IDX_ADD=$(( _n + 4 ))
+        IDX_QUIT=$(( _n + 5 ))
+
+        echo -e "  ${BOLD}${CYAN}[${IDX_STARTALL}]${RESET}  Start all servers"
+        echo -e "  ${BOLD}${CYAN}[${IDX_STOPALL}]${RESET}  Stop all servers"
+        echo -e "  ${BOLD}${CYAN}[${IDX_LOGS}]${RESET}  View crash logs"
+        echo -e "  ${BOLD}${CYAN}[${IDX_ADD}]${RESET}  Add a new server"
+        echo -e "  ${BOLD}${CYAN}[${IDX_QUIT}]${RESET}  Quit"
     else
-        info "No servers found in ${LEAFMC_DIR}."
+        info "No servers found in ${SERVERS_DIR}."
         echo
         sep
-        ADD_IDX=1
-        QUIT_IDX=2
+        IDX_STARTALL=-1
+        IDX_STOPALL=-1
+        IDX_LOGS=-1
+        IDX_ADD=1
+        IDX_QUIT=2
+
+        echo -e "  ${BOLD}${CYAN}[${IDX_ADD}]${RESET}  Add a new server"
+        echo -e "  ${BOLD}${CYAN}[${IDX_QUIT}]${RESET}  Quit"
     fi
 
-    echo -e "  ${BOLD}${CYAN}[${ADD_IDX}]${RESET}  Add a new server"
-    echo -e "  ${BOLD}${CYAN}[${QUIT_IDX}]${RESET}  Quit"
     echo
 
     read -rp "$(echo -e "${BOLD}Choose an option: ${RESET}")" main_choice
 
     if ! [[ "$main_choice" =~ ^[0-9]+$ ]]; then
-        warn "Please enter a number."
-        sleep 1
-        continue
+        warn "Please enter a number."; sleep 1; continue
     fi
 
-    if (( main_choice == QUIT_IDX )); then
-        echo
-        info "Bye!"
-        echo
-        exit 0
-    elif (( main_choice == ADD_IDX )); then
+    if (( main_choice == IDX_QUIT )); then
+        echo; info "Bye!"; echo; exit 0
+    elif (( main_choice == IDX_ADD )); then
         add_new_server
+    elif (( IDX_STARTALL > 0 && main_choice == IDX_STARTALL )); then
+        start_all_servers
+    elif (( IDX_STOPALL > 0 && main_choice == IDX_STOPALL )); then
+        stop_all_servers
+    elif (( IDX_LOGS > 0 && main_choice == IDX_LOGS )); then
+        view_crash_logs
     elif [[ "${#ALL_SERVERS[@]}" -gt 0 ]] && (( main_choice >= 1 && main_choice <= ${#ALL_SERVERS[@]} )); then
         manage_server "${ALL_SERVERS[$((main_choice-1))]}"
     else
-        warn "Invalid selection."
-        sleep 1
+        warn "Invalid selection."; sleep 1
     fi
 done
