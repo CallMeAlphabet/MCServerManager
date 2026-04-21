@@ -2,7 +2,7 @@
 # =============================================================================
 #  MCServerManager — /opt/mcservers/server.sh
 #
-#  Supports: LeafMC, Paper, Purpur, Spigot, Bukkit, Fabric, Vanilla
+#  Supports: LeafMC, Paper, Purpur, Spigot, Fabric, Vanilla
 #
 #  Dependencies:
 #    tmux      — pacman -S tmux  |  apt install tmux
@@ -35,6 +35,14 @@ warn()    { echo -e "${YELLOW}${BOLD}[!]${RESET} $*"; }
 err()     { echo -e "${RED}${BOLD}[✗]${RESET} $*"; }
 sep()     { echo -e "${CYAN}$(printf '─%.0s' {1..60})${RESET}"; }
 
+# Interactive flag: false when called from cron so prompts are skipped.
+_INTERACTIVE=true
+[[ ! -t 0 ]] && _INTERACTIVE=false
+
+pause() {
+    $(_INTERACTIVE) && read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")" || true
+}
+
 # =============================================================================
 #  CLI MODE — before check_deps so cron doesn't get blocked by prompts
 # =============================================================================
@@ -42,6 +50,7 @@ if [[ "${1:-}" == "--backup" && -n "${2:-}" ]]; then
     _CLI_NAME="$2"
     _CLI_DIR="${SERVERS_DIR}/${_CLI_NAME}"
     _CLI_BACKUP=1
+    _INTERACTIVE=false
 else
     _CLI_BACKUP=0
 fi
@@ -84,6 +93,7 @@ write_meta() {
 server_name()    { basename "$1"; }
 server_type()    { read_meta "$1" "type"; }
 server_version() { read_meta "$1" "version"; }
+server_notes()   { read_meta "$1" "notes"; }
 
 # ── RCON config (.mcserver.conf) ─────────────────────────────────────────────
 conf_path() { echo "${1}/.mcserver.conf"; }
@@ -128,6 +138,100 @@ rcon_available() {
 }
 
 # =============================================================================
+#  JAVA VERSION CHECK
+# =============================================================================
+# Returns the major version of whichever `java` is on PATH (e.g. 21, 17, 8).
+get_java_major() {
+    local raw
+    raw=$(java -version 2>&1 | head -1 | grep -oP '(?<=version ")[^"]+')
+    # Handles "1.8.0_xxx" (Java 8) and "17.0.x" / "21.0.x" style
+    if [[ "$raw" == 1.* ]]; then
+        echo "${raw#1.}" | cut -d. -f1
+    else
+        echo "$raw" | cut -d. -f1
+    fi
+}
+
+# Minimum Java major version required for a given MC version string.
+min_java_for_mc() {
+    local mc="$1"
+    local major minor
+    major=$(echo "$mc" | cut -d. -f1)
+    minor=$(echo "$mc" | cut -d. -f2)
+    # 1.20.5+  → Java 21
+    # 1.17–1.20.4 → Java 17
+    # older       → Java 8
+    if (( minor >= 20 )); then
+        local patch
+        patch=$(echo "$mc" | cut -d. -f3)
+        patch="${patch:-0}"
+        if (( minor > 20 || patch >= 5 )); then
+            echo 21; return
+        fi
+    fi
+    if (( minor >= 17 )); then
+        echo 17; return
+    fi
+    echo 8
+}
+
+check_java_for_server() {
+    local dir="$1"
+    local mc_ver
+    mc_ver=$(server_version "$dir")
+    [[ -z "$mc_ver" ]] && return
+
+    local required actual
+    required=$(min_java_for_mc "$mc_ver")
+    actual=$(get_java_major 2>/dev/null) || { warn "Could not determine Java version."; return; }
+
+    if (( actual < required )); then
+        echo
+        warn "Java version mismatch!"
+        warn "Minecraft ${mc_ver} requires Java ${required}+, but you have Java ${actual}."
+        warn "The server may crash on startup until Java is updated."
+        echo
+    fi
+}
+
+# =============================================================================
+#  PORT CONFLICT CHECK
+# =============================================================================
+get_server_port() {
+    local dir="$1"
+    local props="${dir}/server.properties"
+    [[ -f "$props" ]] && grep -oP '(?<=^server-port=)\d+' "$props" 2>/dev/null || echo "25565"
+}
+
+check_port_conflict() {
+    local dir="$1"
+    local port
+    port=$(get_server_port "$dir")
+
+    # Try ss first, then netstat, then lsof
+    local in_use=false
+    if command -v ss &>/dev/null; then
+        ss -ltn 2>/dev/null | grep -q ":${port} " && in_use=true
+    elif command -v netstat &>/dev/null; then
+        netstat -ltn 2>/dev/null | grep -q ":${port} " && in_use=true
+    elif command -v lsof &>/dev/null; then
+        lsof -i ":${port}" -sTCP:LISTEN &>/dev/null && in_use=true
+    fi
+
+    if $in_use; then
+        warn "Port ${port} is already in use on this machine."
+        warn "Another server may already be running on this port."
+        warn "Edit server.properties to change the port, or stop the conflicting process."
+        echo
+        local ans
+        read -rp "$(echo -e "${BOLD}Start anyway? [y/N]: ${RESET}")" ans
+        ans="${ans,,}"
+        [[ "$ans" != "y" ]] && return 1
+    fi
+    return 0
+}
+
+# =============================================================================
 #  TMUX / PROCESS HELPERS
 # =============================================================================
 session_name() { echo "${TMUX_PREFIX}-$(basename "$1" | tr ' .' '_')"; }
@@ -138,7 +242,6 @@ server_running() {
     tmux has-session -t "$sess" 2>/dev/null
 }
 
-# Find the java process for this server by matching the server directory path.
 get_server_pid() {
     pgrep -f "java.*${1}" 2>/dev/null | head -1 || true
 }
@@ -146,8 +249,11 @@ get_server_pid() {
 get_resource_usage() {
     local pid="$1"
     [[ -z "$pid" ]] && { echo "? ?"; return; }
+    # Verify the PID still exists before calling ps
+    kill -0 "$pid" 2>/dev/null || { echo "? ?"; return; }
     local cpu mem_kb mem_mb
-    cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ' || echo "?")
+    cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ')
+    [[ -z "$cpu" ]] && { echo "? ?"; return; }
     mem_kb=$(ps -p "$pid" -o rss= 2>/dev/null | tr -d ' ' || echo "0")
     mem_mb=$(( ${mem_kb:-0} / 1024 ))
     echo "$cpu $mem_mb"
@@ -196,7 +302,6 @@ download_url() {
         paper)   echo "https://fill-ui.papermc.io/projects/paper" ;;
         purpur)  echo "https://purpurmc.org/download/purpur/${version}" ;;
         spigot)  echo "https://www.spigotmc.org/wiki/buildtools/" ;;
-        bukkit)  echo "https://getbukkit.org/download/craftbukkit" ;;
         fabric)  echo "https://fabricmc.net/use/server/" ;;
         vanilla) echo "https://www.minecraft.net/en-us/article/minecraft-java-edition-${vanilla_slug}" ;;
         *)       echo "" ;;
@@ -205,12 +310,10 @@ download_url() {
 
 open_url() {
     local url="$1"
-    # Try xdg-open first (respects the user's default browser on any desktop)
     if command -v xdg-open &>/dev/null; then
         xdg-open "$url" &>/dev/null & disown
         return 0
     fi
-    # Fallback: try common browsers in order
     local browsers=(firefox chromium chromium-browser google-chrome google-chrome-stable
                     brave-browser microsoft-edge opera vivaldi)
     for b in "${browsers[@]}"; do
@@ -219,7 +322,6 @@ open_url() {
             return 0
         fi
     done
-    # No browser found — print the URL
     echo -e "  ${YELLOW}No browser found. Open this URL manually:${RESET}"
     echo -e "  ${BOLD}${CYAN}${url}${RESET}"
     return 1
@@ -231,7 +333,7 @@ maybe_open_url() {
     echo
     local ans
     read -rp "$(echo -e "${BOLD}Open in browser? [Y/n]: ${RESET}")" ans
-    ans="${ans,,}"   # lowercase
+    ans="${ans,,}"
     if [[ "$ans" != "n" ]]; then
         open_url "$url" && echo -e "  ${DIM}Browser opened. Come back once the download finishes.${RESET}"
     fi
@@ -243,17 +345,16 @@ maybe_open_url() {
 #  The watcher runs inside the tmux session as the main process. start.sh runs
 #  in its foreground, so `tmux attach` shows the live MC console as expected.
 #
-#  On exit:
-#   - ServerManager/stopping present → intentional stop, watcher exits cleanly.
-#   - Otherwise → crash: logged to /opt/mcservers/LOGS/YYYY-MM-DD.log, server
-#     is restarted automatically. After 3 crashes in 10 minutes, gives up.
+#  Clean exit detection:
+#   - ServerManager/stopping flag set (menu-triggered stop) → exit cleanly
+#   - start.sh exits with code 0 (MC `stop` command typed in console) → exit cleanly
+#   - Any other non-zero exit → crash: log, wait 5s, restart
+#     After MAX_CRASHES in WINDOW seconds, give up.
 # =============================================================================
 generate_watcher() {
     local dir="$1"
     mkdir -p "$(sm_dir "$dir")"
 
-    # WATCHER_EOF is single-quoted so variables are NOT expanded here —
-    # the watcher defines its own at runtime.
     cat > "$(sm_file "$dir" "watcher.sh")" <<'WATCHER_EOF'
 #!/usr/bin/env bash
 # Auto-generated by MCServerManager — do not edit manually.
@@ -272,7 +373,7 @@ _log() {
 }
 
 while true; do
-    # Intentional stop before (re)start?
+    # Intentional stop requested before (re)start?
     if [[ -f "${SERVER_DIR}/ServerManager/stopping" ]]; then
         rm -f "${SERVER_DIR}/ServerManager/stopping"
         exit 0
@@ -284,9 +385,12 @@ while true; do
     EXIT_CODE=$?
     END_TIME=$(date +%s)
 
-    # Intentional stop during shutdown?
+    # Clean exit: stopping flag (menu) OR exit code 0 (console `stop` command)
     if [[ -f "${SERVER_DIR}/ServerManager/stopping" ]]; then
         rm -f "${SERVER_DIR}/ServerManager/stopping"
+        exit 0
+    fi
+    if [[ "$EXIT_CODE" -eq 0 ]]; then
         exit 0
     fi
 
@@ -298,7 +402,6 @@ while true; do
     _log "CRASH: ${SERVER_NAME}"
     _log "Ran for: ${DURATION}s  |  Exit code: ${EXIT_CODE}"
 
-    # Drop timestamps outside the window
     NEW_TIMES=()
     for t in "${CRASH_TIMES[@]}"; do
         (( NOW - t < WINDOW )) && NEW_TIMES+=("$t")
@@ -318,7 +421,7 @@ while true; do
     _log "Restarting ${SERVER_NAME} (crash ${#CRASH_TIMES[@]}/${MAX_CRASHES})..."
     _log "════════════════════════════════════════"
     echo ""
-    echo ">>> ${SERVER_NAME} crashed. Restarting in 5s... (${#CRASH_TIMES[@]}/${MAX_CRASHES} in $(( WINDOW / 60 ))min window)"
+    echo ">>> ${SERVER_NAME} crashed (exit ${EXIT_CODE}). Restarting in 5s... (${#CRASH_TIMES[@]}/${MAX_CRASHES} in $(( WINDOW / 60 ))min window)"
     sleep 5
 done
 WATCHER_EOF
@@ -362,11 +465,14 @@ backup_server() {
         rcon_send "$dir" "save-off" &>/dev/null || true
         rcon_used=true
     elif server_running "$dir"; then
-        warn "Server is running but RCON is not configured."
-        warn "Backup may catch mid-write world files. Proceed anyway?"
-        local confirm
-        read -rp "$(echo -e "${BOLD}[y/N]: ${RESET}")" confirm
-        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+        if [[ "$_INTERACTIVE" == true ]]; then
+            warn "Server is running but RCON is not configured."
+            warn "Backup may catch mid-write world files. Proceed anyway?"
+            local confirm
+            read -rp "$(echo -e "${BOLD}[y/N]: ${RESET}")" confirm
+            [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+        fi
+        # In cron mode, proceed anyway — best-effort backup
     fi
 
     tar -czf "$archive" \
@@ -397,7 +503,7 @@ backup_server() {
     size=$(du -sh "$archive" 2>/dev/null | cut -f1)
     success "Backup saved: ${CYAN}$(basename "$archive")${RESET} (${size})"
     echo
-    read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+    [[ "$_INTERACTIVE" == true ]] && read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")" || true
 }
 
 schedule_backup() {
@@ -463,10 +569,10 @@ list_backups() {
     echo -e "  ${BOLD}Backups for ${name}:${RESET}"
     sep
     for i in "${!BACKUPS[@]}"; do
-        local bname size
+        local bname bsize
         bname=$(basename "${BACKUPS[$i]}")
-        size=$(du -sh "${BACKUPS[$i]}" 2>/dev/null | cut -f1)
-        echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${bname}  ${DIM}(${size})${RESET}"
+        bsize=$(du -sh "${BACKUPS[$i]}" 2>/dev/null | cut -f1)
+        echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${bname}  ${DIM}(${bsize})${RESET}"
     done
     echo
     sep
@@ -547,40 +653,80 @@ resource_monitor() {
     ram=$(get_ram "$dir")
 
     echo
-    info "Monitoring ${BOLD}${name}${RESET} — press Ctrl+C to stop"
+    info "Monitoring ${BOLD}${name}${RESET} — press Ctrl+C to exit"
     echo
-    printf "  %-10s  %-20s  %s\n" "CPU %" "RAM used / allocated" "RAM %"
+    printf "  %-10s  %-22s  %s\n" "CPU %" "RAM used / allocated" "RAM %"
     sep
 
+    local last_pid=""
     while true; do
         if ! server_running "$dir"; then
             echo; warn "Server stopped."; break
         fi
 
-        local pid cpu mem_mb ram_mb mem_pct
+        local pid
         pid=$(get_server_pid "$dir")
 
         if [[ -z "$pid" ]]; then
-            printf "\r  ${DIM}Waiting for Java process...${RESET}                    "
+            printf "\r  ${DIM}Waiting for Java process...${RESET}                         "
+            last_pid=""
         else
-            local usage
+            # PID changed (restart) — reset last_pid so we don't show stale data
+            [[ "$pid" != "$last_pid" ]] && last_pid="$pid"
+
+            local usage cpu mem_mb ram_mb mem_pct
             usage=$(get_resource_usage "$pid")
             cpu=$(echo "$usage" | cut -d' ' -f1)
             mem_mb=$(echo "$usage" | cut -d' ' -f2)
-            ram_mb=$(( ${ram:-0} * 1024 ))
-            if [[ "$ram_mb" -gt 0 ]]; then
-                mem_pct=$(( mem_mb * 100 / ram_mb ))
+
+            if [[ "$cpu" == "?" ]]; then
+                # PID disappeared between get_server_pid and get_resource_usage
+                printf "\r  ${DIM}Process restarting...${RESET}                              "
             else
-                mem_pct="?"
+                ram_mb=$(( ${ram:-0} * 1024 ))
+                if [[ "$ram_mb" -gt 0 && "$mem_mb" =~ ^[0-9]+$ ]]; then
+                    mem_pct=$(( mem_mb * 100 / ram_mb ))
+                else
+                    mem_pct="?"
+                fi
+                printf "\r  %-10s  %-22s  %s%%        " \
+                    "${cpu}%" \
+                    "${mem_mb}MB / ${ram}G" \
+                    "$mem_pct"
             fi
-            printf "\r  %-10s  %-20s  %s%%        " \
-                "${cpu}%" \
-                "${mem_mb}MB / ${ram}G" \
-                "$mem_pct"
         fi
         sleep 2
     done
 
+    echo
+    read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+}
+
+# =============================================================================
+#  CONSOLE LOG TAIL  (non-intrusive — no tmux attach needed)
+# =============================================================================
+view_console_tail() {
+    local dir="$1"
+    local name
+    name=$(server_name "$dir")
+    local sess
+    sess=$(session_name "$dir")
+
+    if ! server_running "$dir"; then
+        warn "Server is not running."
+        echo
+        read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+        return
+    fi
+
+    print_banner
+    echo -e "  ${BOLD}Console output — ${name}${RESET}  ${DIM}(last 40 lines)${RESET}"
+    sep
+    echo
+    # capture-pane -p dumps the visible pane content; -J joins wrapped lines
+    tmux capture-pane -p -J -t "$sess" -S -40 2>/dev/null || warn "Could not capture pane output."
+    echo
+    sep
     echo
     read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
 }
@@ -607,10 +753,10 @@ view_crash_logs() {
     fi
 
     for i in "${!LOGS[@]}"; do
-        local lname size
+        local lname lsize
         lname=$(basename "${LOGS[$i]}")
-        size=$(du -sh "${LOGS[$i]}" 2>/dev/null | cut -f1)
-        echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${lname}  ${DIM}(${size})${RESET}"
+        lsize=$(du -sh "${LOGS[$i]}" 2>/dev/null | cut -f1)
+        echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${lname}  ${DIM}(${lsize})${RESET}"
     done
     echo
     sep
@@ -631,6 +777,114 @@ view_crash_logs() {
 }
 
 # =============================================================================
+#  DUPLICATE SERVER
+# =============================================================================
+duplicate_server() {
+    local src_dir="$1"
+    local src_name
+    src_name=$(server_name "$src_dir")
+
+    print_banner
+    echo -e "  ${BOLD}Duplicate server — ${src_name}${RESET}"
+    echo
+    sep
+    echo
+
+    local new_name
+    while true; do
+        read -rp "$(echo -e "${BOLD}New server name: ${RESET}")" new_name
+        new_name="${new_name// /-}"
+        if [[ -z "$new_name" ]]; then
+            warn "Name cannot be empty."
+        elif [[ -e "${SERVERS_DIR}/${new_name}" ]]; then
+            warn "A server named '${new_name}' already exists."
+        else
+            break
+        fi
+        echo
+    done
+
+    echo
+    local ans
+    read -rp "$(echo -e "${BOLD}Copy world data too? [y/N]: ${RESET}")" ans
+    ans="${ans,,}"
+    local copy_world=false
+    [[ "$ans" == "y" ]] && copy_world=true
+
+    local dest_dir="${SERVERS_DIR}/${new_name}"
+    info "Duplicating ${src_name} → ${new_name}..."
+
+    if $copy_world; then
+        cp -r "$src_dir" "$dest_dir"
+    else
+        # Copy everything except world folders (world, world_nether, world_the_end, and any custom ones)
+        mkdir -p "$dest_dir"
+        rsync -a \
+            --exclude="world/" \
+            --exclude="world_nether/" \
+            --exclude="world_the_end/" \
+            --exclude="*.log" \
+            --exclude="logs/" \
+            "$src_dir/" "$dest_dir/" 2>/dev/null || \
+        # rsync fallback: use cp with manual world exclusion
+        ( cp -r "$src_dir/." "$dest_dir/"
+          rm -rf "${dest_dir}/world" "${dest_dir}/world_nether" "${dest_dir}/world_the_end" 2>/dev/null
+          true )
+    fi
+
+    # Regenerate the watcher (it has the path embedded)
+    generate_watcher "$dest_dir"
+
+    success "Duplicated to ${CYAN}${dest_dir}${RESET}"
+    echo
+    read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+}
+
+# =============================================================================
+#  BROADCAST TO ALL RUNNING SERVERS
+# =============================================================================
+broadcast_all() {
+    print_banner
+    echo -e "  ${BOLD}Broadcast to all running servers${RESET}"
+    echo
+    sep
+    echo
+
+    local running=()
+    for dir in "${ALL_SERVERS[@]}"; do
+        server_running "$dir" && running+=("$dir")
+    done
+
+    if [[ "${#running[@]}" -eq 0 ]]; then
+        warn "No servers are currently running."
+        echo
+        read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+        return
+    fi
+
+    echo -e "  Running servers: $(for d in "${running[@]}"; do echo -n "$(server_name "$d") "; done)"
+    echo
+    local cmd
+    read -rp "$(echo -e "${BOLD}Command to broadcast: ${RESET}")" cmd
+    echo
+
+    for dir in "${running[@]}"; do
+        local name
+        name=$(server_name "$dir")
+        if rcon_available "$dir"; then
+            rcon_send "$dir" "$cmd" &>/dev/null && success "Sent to ${name}" || warn "Failed: ${name}"
+        else
+            local sess
+            sess=$(session_name "$dir")
+            tmux send-keys -t "$sess" "$cmd" Enter 2>/dev/null && success "Sent to ${name} (tmux)" || warn "Failed: ${name}"
+        fi
+    done
+
+    echo
+    read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+}
+
+# =============================================================================
 #  MANAGE EXISTING SERVER
 # =============================================================================
 manage_server() {
@@ -639,12 +893,13 @@ manage_server() {
     while true; do
         print_banner
 
-        local name type version state ram running_badge
+        local name type version state ram running_badge notes
         name=$(server_name "$dir")
         type=$(server_type "$dir")
         version=$(server_version "$dir")
         state=$(server_state "$dir")
         ram=$(get_ram "$dir")
+        notes=$(server_notes "$dir")
         [[ -z "$type" ]]    && type="unknown"
         [[ -z "$version" ]] && version="unknown"
 
@@ -657,6 +912,7 @@ manage_server() {
         echo -e "  ${BOLD}Managing:${RESET} ${GREEN}${BOLD}${name}${RESET}  ${running_badge}"
         echo -e "  ${DIM}Type: ${type}  |  Version: ${version}  |  Path: ${dir}${RESET}"
         [[ "$state" == "initialized" ]] && echo -e "  ${DIM}RAM: ${ram}G${RESET}"
+        [[ -n "$notes" ]] && echo -e "  ${DIM}Notes: ${notes}${RESET}"
         echo
         sep
 
@@ -669,9 +925,11 @@ manage_server() {
         if [[ "$state" == "initialized" ]]; then
             if server_running "$dir"; then
                 options+=("Attach to console")
+                options+=("View console output")
                 options+=("Send command to server")
                 options+=("Resource monitor")
                 options+=("Stop server gracefully")
+                options+=("Force stop")
             else
                 options+=("Start server")
             fi
@@ -679,8 +937,10 @@ manage_server() {
             options+=("View / restore / schedule backups")
             options+=("Edit server.properties")
             options+=("Change RAM allocation")
+            options+=("Duplicate server")
         fi
 
+        options+=("Edit notes")
         options+=("Rename server")
         options+=("Delete server")
         options+=("Back to main menu")
@@ -688,10 +948,12 @@ manage_server() {
         for i in "${!options[@]}"; do
             local label="${options[$i]}"
             case "$label" in
-                "Attach to console")
+                "Attach to console"|"View console output")
                     echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${GREEN}${label}${RESET}" ;;
                 "Stop server gracefully")
                     echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${YELLOW}${label}${RESET}" ;;
+                "Force stop")
+                    echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${RED}${label}${RESET}" ;;
                 "Delete server")
                     echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${RED}${label}${RESET}" ;;
                 "Change RAM allocation")
@@ -722,6 +984,8 @@ manage_server() {
                 watcher=$(sm_file "$dir" "watcher.sh")
                 [[ ! -f "$watcher" ]] && generate_watcher "$dir"
                 echo
+                check_java_for_server "$dir"
+                check_port_conflict "$dir" || { sleep 1; continue; }
                 info "Starting ${name} in tmux session '${sess}'..."
                 tmux new-session -d -s "$sess" -c "$dir" "bash ${watcher}"
                 sleep 3
@@ -745,6 +1009,9 @@ manage_server() {
                 sleep 1
                 tmux attach-session -t "$sess" || warn "Session not found."
                 ;;
+
+            "View console output")
+                view_console_tail "$dir" ;;
 
             "Send command to server")
                 echo
@@ -790,6 +1057,28 @@ manage_server() {
                 read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
                 ;;
 
+            "Force stop")
+                echo
+                warn "This will immediately kill the server process without a clean shutdown."
+                warn "Unsaved world data may be lost."
+                local fconfirm
+                read -rp "$(echo -e "${BOLD}Type 'yes' to confirm force stop: ${RESET}")" fconfirm
+                if [[ "$fconfirm" == "yes" ]]; then
+                    touch "$(sm_file "$dir" "stopping")"
+                    local sess fpid
+                    sess=$(session_name "$dir")
+                    fpid=$(get_server_pid "$dir")
+                    [[ -n "$fpid" ]] && kill -9 "$fpid" 2>/dev/null || true
+                    sleep 1
+                    tmux kill-session -t "$sess" 2>/dev/null || true
+                    success "Server force-stopped."
+                else
+                    warn "Cancelled."
+                fi
+                echo
+                read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+                ;;
+
             "Backup server")
                 backup_server "$dir" ;;
 
@@ -826,6 +1115,20 @@ EOF
                 chmod +x "${dir}/start.sh"
                 success "RAM updated to ${new_ram}G."
                 server_running "$dir" && warn "Restart the server to apply."
+                sleep 1
+                ;;
+
+            "Duplicate server")
+                duplicate_server "$dir" ;;
+
+            "Edit notes")
+                echo
+                local cur_notes new_notes
+                cur_notes=$(server_notes "$dir")
+                [[ -n "$cur_notes" ]] && echo -e "  ${DIM}Current: ${cur_notes}${RESET}" && echo
+                read -rp "$(echo -e "${BOLD}Notes (leave blank to clear): ${RESET}")" new_notes
+                write_meta "$dir" "notes" "$new_notes"
+                success "Notes saved."
                 sleep 1
                 ;;
 
@@ -893,6 +1196,10 @@ run_first_time_setup() {
     echo
     sep
     info "Running first-time setup for ${BOLD}${name}${RESET} (${type})..."
+
+    # Java version check before first run
+    check_java_for_server "$dir"
+
     echo -e "  ${YELLOW}(The server will stop after generating eula.txt)${RESET}"
     echo
 
@@ -943,10 +1250,8 @@ java -Xmx${ram_gb}G -Xms${ram_gb}G -jar ${jar_name} nogui
 EOF
     chmod +x "${dir}/start.sh"
 
-    # ── Generate crash watcher ────────────────────────────────────────────────
     generate_watcher "$dir"
 
-    # ── Default backup retention ──────────────────────────────────────────────
     [[ -z "$(read_meta "$dir" "backup_keep")" ]] && write_meta "$dir" "backup_keep" "5"
 
     echo
@@ -1003,23 +1308,21 @@ add_new_server() {
     echo -e "  ${BOLD}${CYAN}[2]${RESET}  Paper    ${DIM}— most popular high-performance fork${RESET}"
     echo -e "  ${BOLD}${CYAN}[3]${RESET}  Purpur   ${DIM}— Paper fork with extra configurability${RESET}"
     echo -e "  ${BOLD}${CYAN}[4]${RESET}  Spigot   ${DIM}— classic, requires BuildTools${RESET}"
-    echo -e "  ${BOLD}${CYAN}[5]${RESET}  Bukkit   ${DIM}— original plugin platform${RESET}"
-    echo -e "  ${BOLD}${CYAN}[6]${RESET}  Fabric   ${DIM}— lightweight mod loader${RESET}"
-    echo -e "  ${BOLD}${CYAN}[7]${RESET}  Vanilla  ${DIM}— official Mojang server${RESET}"
+    echo -e "  ${BOLD}${CYAN}[5]${RESET}  Fabric   ${DIM}— lightweight mod loader${RESET}"
+    echo -e "  ${BOLD}${CYAN}[6]${RESET}  Vanilla  ${DIM}— official Mojang server${RESET}"
     echo
 
     local type_choice srv_type
     while true; do
-        read -rp "$(echo -e "${BOLD}Choose [1–7]: ${RESET}")" type_choice
+        read -rp "$(echo -e "${BOLD}Choose [1–6]: ${RESET}")" type_choice
         case "$type_choice" in
             1) srv_type="leafmc";  break ;;
             2) srv_type="paper";   break ;;
             3) srv_type="purpur";  break ;;
             4) srv_type="spigot";  break ;;
-            5) srv_type="bukkit";  break ;;
-            6) srv_type="fabric";  break ;;
-            7) srv_type="vanilla"; break ;;
-            *) warn "Please pick 1–7." ;;
+            5) srv_type="fabric";  break ;;
+            6) srv_type="vanilla"; break ;;
+            *) warn "Please pick 1–6." ;;
         esac
     done
 
@@ -1069,6 +1372,8 @@ start_all_servers() {
             sess=$(session_name "$dir")
             watcher=$(sm_file "$dir" "watcher.sh")
             [[ ! -f "$watcher" ]] && generate_watcher "$dir"
+            check_java_for_server "$dir"
+            check_port_conflict "$dir" || { warn "Skipping ${name} due to port conflict."; continue; }
             tmux new-session -d -s "$sess" -c "$dir" "bash ${watcher}"
             success "Started: ${name}"
             (( started++ )) || true
@@ -1120,7 +1425,7 @@ fi
 check_deps
 mkdir -p "$SERVERS_DIR" "$BACKUP_BASE" "$LOG_BASE"
 
-declare -a ALL_SERVERS=()
+ALL_SERVERS=()
 
 while true; do
     print_banner
@@ -1136,6 +1441,7 @@ while true; do
             _version=$(server_version "$_dir")
             _state=$(server_state "$_dir")
             _ram=$(get_ram "$_dir")
+            _notes=$(server_notes "$_dir")
             [[ -z "$_type" ]]    && _type="?"
             [[ -z "$_version" ]] && _version="?"
 
@@ -1151,20 +1457,25 @@ while true; do
                 *)           _badge="${DIM}unknown${RESET}" ;;
             esac
 
-            echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${_dot}  ${BOLD}${_name}${RESET}  ${DIM}|${RESET}  ${_badge}"
+            _notes_str=""
+            [[ -n "$_notes" ]] && _notes_str="  ${DIM}${_notes}${RESET}"
+
+            echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${_dot}  ${BOLD}${_name}${RESET}  ${DIM}|${RESET}  ${_badge}${_notes_str}"
         done
         echo
         sep
 
-        local _n="${#ALL_SERVERS[@]}"
+        _n="${#ALL_SERVERS[@]}"
         IDX_STARTALL=$(( _n + 1 ))
         IDX_STOPALL=$(( _n + 2 ))
-        IDX_LOGS=$(( _n + 3 ))
-        IDX_ADD=$(( _n + 4 ))
-        IDX_QUIT=$(( _n + 5 ))
+        IDX_BROADCAST=$(( _n + 3 ))
+        IDX_LOGS=$(( _n + 4 ))
+        IDX_ADD=$(( _n + 5 ))
+        IDX_QUIT=$(( _n + 6 ))
 
         echo -e "  ${BOLD}${CYAN}[${IDX_STARTALL}]${RESET}  Start all servers"
         echo -e "  ${BOLD}${CYAN}[${IDX_STOPALL}]${RESET}  Stop all servers"
+        echo -e "  ${BOLD}${CYAN}[${IDX_BROADCAST}]${RESET}  Broadcast command to all"
         echo -e "  ${BOLD}${CYAN}[${IDX_LOGS}]${RESET}  View crash logs"
         echo -e "  ${BOLD}${CYAN}[${IDX_ADD}]${RESET}  Add a new server"
         echo -e "  ${BOLD}${CYAN}[${IDX_QUIT}]${RESET}  Quit"
@@ -1174,6 +1485,7 @@ while true; do
         sep
         IDX_STARTALL=-1
         IDX_STOPALL=-1
+        IDX_BROADCAST=-1
         IDX_LOGS=-1
         IDX_ADD=1
         IDX_QUIT=2
@@ -1198,6 +1510,8 @@ while true; do
         start_all_servers
     elif (( IDX_STOPALL > 0 && main_choice == IDX_STOPALL )); then
         stop_all_servers
+    elif (( IDX_BROADCAST > 0 && main_choice == IDX_BROADCAST )); then
+        broadcast_all
     elif (( IDX_LOGS > 0 && main_choice == IDX_LOGS )); then
         view_crash_logs
     elif [[ "${#ALL_SERVERS[@]}" -gt 0 ]] && (( main_choice >= 1 && main_choice <= ${#ALL_SERVERS[@]} )); then
