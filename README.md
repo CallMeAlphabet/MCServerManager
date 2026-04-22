@@ -9,7 +9,7 @@ That experience got me thinking: why not automate this? So I built a bash script
 
 ## Features
 
-- **Multi-software support** — LeafMC, Paper, Purpur, Spigot, Bukkit, Fabric, and Vanilla
+- **Multi-software support** — LeafMC, Paper, Purpur, Spigot, Fabric, and Vanilla
 - **Named servers** — give each server a name; version and software type are stored in `ServerManager/`
 - **Crash detection & auto-restart** — servers restart automatically on crash; after 3 crashes in 10 minutes the watcher gives up and logs the event
 - **Crash logs** — all crashes are written to `/opt/mcservers/LOGS/YYYY-MM-DD.log` with timestamps and exit codes
