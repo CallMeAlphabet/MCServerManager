@@ -4,11 +4,16 @@
 #
 #  Supports: LeafMC, Paper, Purpur, Spigot, Fabric, Vanilla
 #
-#  Dependencies:
-#    tmux      — pacman -S tmux  |  apt install tmux
-#    mcrcon    — paru -S mcrcon  |  https://github.com/Tiiffi/mcrcon
-#    curl      — pacman -S curl  |  apt install curl
-#    openssl   — pacman -S openssl | apt install openssl
+#  Dependencies (required):
+#    tmux      — pacman -S tmux        | apt install tmux
+#    mcrcon    — paru -S mcrcon        | https://github.com/Tiiffi/mcrcon
+#    curl      — pacman -S curl        | apt install curl
+#    openssl   — pacman -S openssl     | apt install openssl
+#
+#  Dependencies (optional):
+#    tailscale — https://tailscale.com/download
+#    firejail  — pacman -S firejail    | apt install firejail
+#    ufw       — pacman -S ufw         | apt install ufw
 # =============================================================================
 
 set -euo pipefail
@@ -35,16 +40,11 @@ warn()    { echo -e "${YELLOW}${BOLD}[!]${RESET} $*"; }
 err()     { echo -e "${RED}${BOLD}[✗]${RESET} $*"; }
 sep()     { echo -e "${CYAN}$(printf '─%.0s' {1..60})${RESET}"; }
 
-# Interactive flag: false when called from cron so prompts are skipped.
 _INTERACTIVE=true
 [[ ! -t 0 ]] && _INTERACTIVE=false
 
-pause() {
-    $(_INTERACTIVE) && read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")" || true
-}
-
 # =============================================================================
-#  CLI MODE — before check_deps so cron doesn't get blocked by prompts
+#  CLI MODE — before check_deps so cron doesn't get blocked
 # =============================================================================
 if [[ "${1:-}" == "--backup" && -n "${2:-}" ]]; then
     _CLI_NAME="$2"
@@ -63,9 +63,7 @@ check_deps() {
     command -v curl    &>/dev/null || missing+=("curl")
     command -v openssl &>/dev/null || missing+=("openssl")
     if [[ "${#missing[@]}" -gt 0 ]]; then
-        warn "Missing dependencies: ${missing[*]}"
-        echo
-        warn "Some features will not work until these are installed."
+        warn "Missing required dependencies: ${missing[*]}"
         echo
         read -rp "$(echo -e "${BOLD}Press Enter to continue anyway...${RESET}")"
     fi
@@ -94,6 +92,7 @@ server_name()    { basename "$1"; }
 server_type()    { read_meta "$1" "type"; }
 server_version() { read_meta "$1" "version"; }
 server_notes()   { read_meta "$1" "notes"; }
+server_port()    { read_meta "$1" "port"; }
 
 # ── RCON config (.mcserver.conf) ─────────────────────────────────────────────
 conf_path() { echo "${1}/.mcserver.conf"; }
@@ -114,6 +113,8 @@ write_conf() {
     else
         echo "${key}=${value}" >> "$conf"
     fi
+    # Always ensure conf is owner-readable only
+    chmod 600 "$conf" 2>/dev/null || true
 }
 
 rcon_password() { read_conf "$1" "rcon_password"; }
@@ -140,11 +141,9 @@ rcon_available() {
 # =============================================================================
 #  JAVA VERSION CHECK
 # =============================================================================
-# Returns the major version of whichever `java` is on PATH (e.g. 21, 17, 8).
 get_java_major() {
     local raw
     raw=$(java -version 2>&1 | head -1 | grep -oP '(?<=version ")[^"]+')
-    # Handles "1.8.0_xxx" (Java 8) and "17.0.x" / "21.0.x" style
     if [[ "$raw" == 1.* ]]; then
         echo "${raw#1.}" | cut -d. -f1
     else
@@ -152,27 +151,18 @@ get_java_major() {
     fi
 }
 
-# Minimum Java major version required for a given MC version string.
 min_java_for_mc() {
     local mc="$1"
-    local major minor
-    major=$(echo "$mc" | cut -d. -f1)
+    local minor patch
     minor=$(echo "$mc" | cut -d. -f2)
-    # 1.20.5+  → Java 21
-    # 1.17–1.20.4 → Java 17
-    # older       → Java 8
-    if (( minor >= 20 )); then
-        local patch
-        patch=$(echo "$mc" | cut -d. -f3)
-        patch="${patch:-0}"
-        if (( minor > 20 || patch >= 5 )); then
-            echo 21; return
-        fi
+    patch=$(echo "$mc" | cut -d. -f3); patch="${patch:-0}"
+    if (( minor > 20 )) || (( minor == 20 && patch >= 5 )); then
+        echo 21
+    elif (( minor >= 17 )); then
+        echo 17
+    else
+        echo 8
     fi
-    if (( minor >= 17 )); then
-        echo 17; return
-    fi
-    echo 8
 }
 
 check_java_for_server() {
@@ -195,38 +185,197 @@ check_java_for_server() {
 }
 
 # =============================================================================
-#  PORT CONFLICT CHECK
+#  NETWORKING HELPERS
 # =============================================================================
-get_server_port() {
-    local dir="$1"
-    local props="${dir}/server.properties"
-    [[ -f "$props" ]] && grep -oP '(?<=^server-port=)\d+' "$props" 2>/dev/null || echo "25565"
+get_public_ip() {
+    curl -s --max-time 5 https://api.ipify.org 2>/dev/null || \
+    curl -s --max-time 5 https://ifconfig.me 2>/dev/null || \
+    echo "unknown"
 }
 
+get_tailscale_ip() {
+    command -v tailscale &>/dev/null && tailscale ip -4 2>/dev/null || echo ""
+}
+
+# Check if a port is in use locally (before binding)
+port_in_use_locally() {
+    local port="$1"
+    if command -v ss &>/dev/null; then
+        ss -ltn 2>/dev/null | grep -q ":${port} " && return 0
+    elif command -v netstat &>/dev/null; then
+        netstat -ltn 2>/dev/null | grep -q ":${port} " && return 0
+    elif command -v lsof &>/dev/null; then
+        lsof -i ":${port}" -sTCP:LISTEN &>/dev/null && return 0
+    fi
+    return 1
+}
+
+# Attempt to check if a port is externally reachable via a public API.
+# Prints "open", "closed", or "unknown".
+check_external_port() {
+    local ip="$1" port="$2"
+    [[ "$ip" == "unknown" ]] && { echo "unknown"; return; }
+    # Use portchecker.co public API
+    local resp
+    resp=$(curl -s --max-time 8 \
+        "https://portchecker.co/api/v1/query" \
+        -H "Content-Type: application/json" \
+        -d "{\"host\":\"${ip}\",\"ports\":[${port}]}" 2>/dev/null) || true
+    if echo "$resp" | grep -q '"status":"open"'; then
+        echo "open"
+    elif echo "$resp" | grep -q '"status":"closed"'; then
+        echo "closed"
+    else
+        echo "unknown"
+    fi
+}
+
+# =============================================================================
+#  WHITELIST / PLAYER UUID LOOKUP
+# =============================================================================
+lookup_player_uuid() {
+    local name="$1"
+    local resp uuid
+    resp=$(curl -s --max-time 8 \
+        "https://api.mojang.com/users/profiles/minecraft/${name}" 2>/dev/null) || true
+    uuid=$(echo "$resp" | grep -oP '(?<="id":")[^"]+') || true
+    # Insert hyphens: 8-4-4-4-12
+    if [[ "${#uuid}" -eq 32 ]]; then
+        echo "${uuid:0:8}-${uuid:8:4}-${uuid:12:4}-${uuid:16:4}-${uuid:20:12}"
+    else
+        echo ""
+    fi
+}
+
+# Write whitelist.json from a list of "name uuid" pairs stored in ServerManager/whitelist
+rebuild_whitelist_json() {
+    local dir="$1"
+    local wl_file
+    wl_file=$(sm_file "$dir" "whitelist")
+    local json="["
+    local first=true
+    if [[ -f "$wl_file" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local pname puuid
+            pname=$(echo "$line" | cut -d' ' -f1)
+            puuid=$(echo "$line" | cut -d' ' -f2)
+            $first || json+=","
+            json+="{\"uuid\":\"${puuid}\",\"name\":\"${pname}\"}"
+            first=false
+        done < "$wl_file"
+    fi
+    json+="]"
+    printf '%s\n' "$json" > "${dir}/whitelist.json"
+}
+
+manage_whitelist() {
+    local dir="$1"
+    local name
+    name=$(server_name "$dir")
+    local wl_file
+    wl_file=$(sm_file "$dir" "whitelist")
+
+    while true; do
+        print_banner
+        echo -e "  ${BOLD}Whitelist — ${name}${RESET}"
+        echo
+        sep
+
+        # Read current whitelist
+        local entries=()
+        if [[ -f "$wl_file" ]]; then
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                entries+=("$line")
+            done < "$wl_file"
+        fi
+
+        if [[ "${#entries[@]}" -eq 0 ]]; then
+            echo -e "  ${DIM}(no players whitelisted)${RESET}"
+        else
+            for i in "${!entries[@]}"; do
+                local pname
+                pname=$(echo "${entries[$i]}" | cut -d' ' -f1)
+                echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${pname}"
+            done
+        fi
+        echo
+        sep
+        echo -e "  ${BOLD}${CYAN}[a]${RESET}  Add player"
+        echo -e "  ${BOLD}${CYAN}[d]${RESET}  Remove player"
+        echo -e "  ${BOLD}${CYAN}[b]${RESET}  Back"
+        echo
+
+        local choice
+        read -rp "$(echo -e "${BOLD}Choose: ${RESET}")" choice
+
+        case "${choice,,}" in
+            a)
+                echo
+                local pname
+                read -rp "$(echo -e "${BOLD}Player name to add: ${RESET}")" pname
+                [[ -z "$pname" ]] && continue
+                info "Looking up UUID for ${pname}..."
+                local puuid
+                puuid=$(lookup_player_uuid "$pname")
+                if [[ -z "$puuid" ]]; then
+                    warn "Could not look up UUID — player may not exist or API is unreachable."
+                    warn "Adding without UUID (server may reject on join)."
+                    puuid="00000000-0000-0000-0000-000000000000"
+                else
+                    success "Found UUID: ${DIM}${puuid}${RESET}"
+                fi
+                echo "${pname} ${puuid}" >> "$wl_file"
+                rebuild_whitelist_json "$dir"
+                # If server is live, reload whitelist via RCON
+                if server_running "$dir" && rcon_available "$dir"; then
+                    rcon_send "$dir" "whitelist reload" &>/dev/null || true
+                    success "Whitelist reloaded on running server."
+                fi
+                success "Added ${pname}."
+                ;;
+            d)
+                echo
+                [[ "${#entries[@]}" -eq 0 ]] && warn "No players to remove." && continue
+                local idx
+                read -rp "$(echo -e "${BOLD}Player number to remove: ${RESET}")" idx
+                if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#entries[@]} )); then
+                    local rem_name
+                    rem_name=$(echo "${entries[$((idx-1))]}" | cut -d' ' -f1)
+                    # Remove line from file
+                    sed -i "${idx}d" "$wl_file"
+                    rebuild_whitelist_json "$dir"
+                    if server_running "$dir" && rcon_available "$dir"; then
+                        rcon_send "$dir" "whitelist reload" &>/dev/null || true
+                    fi
+                    success "Removed ${rem_name}."
+                else
+                    warn "Invalid selection."
+                fi
+                ;;
+            b|"") return ;;
+            *) warn "Invalid choice." ;;
+        esac
+        echo
+        read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+    done
+}
+
+# =============================================================================
+#  PORT CONFLICT CHECK  (pre-start)
+# =============================================================================
 check_port_conflict() {
     local dir="$1"
     local port
-    port=$(get_server_port "$dir")
+    port=$(server_port "$dir")
+    [[ -z "$port" ]] && port=$(grep -oP '(?<=^server-port=)\d+' "${dir}/server.properties" 2>/dev/null || echo "25565")
 
-    # Try ss first, then netstat, then lsof
-    local in_use=false
-    if command -v ss &>/dev/null; then
-        ss -ltn 2>/dev/null | grep -q ":${port} " && in_use=true
-    elif command -v netstat &>/dev/null; then
-        netstat -ltn 2>/dev/null | grep -q ":${port} " && in_use=true
-    elif command -v lsof &>/dev/null; then
-        lsof -i ":${port}" -sTCP:LISTEN &>/dev/null && in_use=true
-    fi
-
-    if $in_use; then
+    if port_in_use_locally "$port"; then
         warn "Port ${port} is already in use on this machine."
-        warn "Another server may already be running on this port."
-        warn "Edit server.properties to change the port, or stop the conflicting process."
-        echo
         local ans
         read -rp "$(echo -e "${BOLD}Start anyway? [y/N]: ${RESET}")" ans
-        ans="${ans,,}"
-        [[ "$ans" != "y" ]] && return 1
+        [[ "${ans,,}" != "y" ]] && return 1
     fi
     return 0
 }
@@ -249,7 +398,6 @@ get_server_pid() {
 get_resource_usage() {
     local pid="$1"
     [[ -z "$pid" ]] && { echo "? ?"; return; }
-    # Verify the PID still exists before calling ps
     kill -0 "$pid" 2>/dev/null || { echo "? ?"; return; }
     local cpu mem_kb mem_mb
     cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ')
@@ -311,15 +459,13 @@ download_url() {
 open_url() {
     local url="$1"
     if command -v xdg-open &>/dev/null; then
-        xdg-open "$url" &>/dev/null & disown
-        return 0
+        xdg-open "$url" &>/dev/null & disown; return 0
     fi
     local browsers=(firefox chromium chromium-browser google-chrome google-chrome-stable
                     brave-browser microsoft-edge opera vivaldi)
     for b in "${browsers[@]}"; do
         if command -v "$b" &>/dev/null; then
-            "$b" "$url" &>/dev/null & disown
-            return 0
+            "$b" "$url" &>/dev/null & disown; return 0
         fi
     done
     echo -e "  ${YELLOW}No browser found. Open this URL manually:${RESET}"
@@ -333,23 +479,12 @@ maybe_open_url() {
     echo
     local ans
     read -rp "$(echo -e "${BOLD}Open in browser? [Y/n]: ${RESET}")" ans
-    ans="${ans,,}"
-    if [[ "$ans" != "n" ]]; then
+    [[ "${ans,,}" != "n" ]] && \
         open_url "$url" && echo -e "  ${DIM}Browser opened. Come back once the download finishes.${RESET}"
-    fi
 }
 
 # =============================================================================
 #  CRASH WATCHER GENERATION
-#
-#  The watcher runs inside the tmux session as the main process. start.sh runs
-#  in its foreground, so `tmux attach` shows the live MC console as expected.
-#
-#  Clean exit detection:
-#   - ServerManager/stopping flag set (menu-triggered stop) → exit cleanly
-#   - start.sh exits with code 0 (MC `stop` command typed in console) → exit cleanly
-#   - Any other non-zero exit → crash: log, wait 5s, restart
-#     After MAX_CRASHES in WINDOW seconds, give up.
 # =============================================================================
 generate_watcher() {
     local dir="$1"
@@ -362,7 +497,7 @@ SERVER_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER_NAME="$(basename "$SERVER_DIR")"
 LOG_BASE="/opt/mcservers/LOGS"
 MAX_CRASHES=3
-WINDOW=600   # 10 minutes in seconds
+WINDOW=600
 
 declare -a CRASH_TIMES=()
 mkdir -p "$LOG_BASE"
@@ -373,7 +508,6 @@ _log() {
 }
 
 while true; do
-    # Intentional stop requested before (re)start?
     if [[ -f "${SERVER_DIR}/ServerManager/stopping" ]]; then
         rm -f "${SERVER_DIR}/ServerManager/stopping"
         exit 0
@@ -385,19 +519,15 @@ while true; do
     EXIT_CODE=$?
     END_TIME=$(date +%s)
 
-    # Clean exit: stopping flag (menu) OR exit code 0 (console `stop` command)
+    # Clean exit: stopping flag OR exit code 0 (console `stop` command)
     if [[ -f "${SERVER_DIR}/ServerManager/stopping" ]]; then
         rm -f "${SERVER_DIR}/ServerManager/stopping"
         exit 0
     fi
-    if [[ "$EXIT_CODE" -eq 0 ]]; then
-        exit 0
-    fi
+    [[ "$EXIT_CODE" -eq 0 ]] && exit 0
 
-    # ── Crash handling ────────────────────────────────────────────────────────
     NOW=$(date +%s)
     DURATION=$(( END_TIME - START_TIME ))
-
     _log "════════════════════════════════════════"
     _log "CRASH: ${SERVER_NAME}"
     _log "Ran for: ${DURATION}s  |  Exit code: ${EXIT_CODE}"
@@ -464,15 +594,11 @@ backup_server() {
         sleep 2
         rcon_send "$dir" "save-off" &>/dev/null || true
         rcon_used=true
-    elif server_running "$dir"; then
-        if [[ "$_INTERACTIVE" == true ]]; then
-            warn "Server is running but RCON is not configured."
-            warn "Backup may catch mid-write world files. Proceed anyway?"
-            local confirm
-            read -rp "$(echo -e "${BOLD}[y/N]: ${RESET}")" confirm
-            [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
-        fi
-        # In cron mode, proceed anyway — best-effort backup
+    elif server_running "$dir" && [[ "$_INTERACTIVE" == true ]]; then
+        warn "Server is running but RCON is not configured. Backup may catch mid-write files."
+        local confirm
+        read -rp "$(echo -e "${BOLD}Proceed anyway? [y/N]: ${RESET}")" confirm
+        [[ "${confirm,,}" != "y" ]] && return
     fi
 
     tar -czf "$archive" \
@@ -486,10 +612,8 @@ backup_server() {
         rcon_send "$dir" "say [Backup] Backup complete, autosave resumed." &>/dev/null || true
     fi
 
-    # ── Prune old backups ─────────────────────────────────────────────────────
     local keep
-    keep=$(read_meta "$dir" "backup_keep")
-    keep="${keep:-5}"
+    keep=$(read_meta "$dir" "backup_keep"); keep="${keep:-5}"
     if [[ "$keep" =~ ^[0-9]+$ ]] && (( keep > 0 )); then
         local count
         count=$(ls -t "${backup_dir}"/*.tar.gz 2>/dev/null | wc -l)
@@ -513,8 +637,7 @@ schedule_backup() {
 
     print_banner
     echo -e "  ${BOLD}Schedule automatic backups — ${name}${RESET}"
-    echo
-    sep
+    echo; sep
     echo -e "  ${BOLD}${CYAN}[1]${RESET}  Every 6 hours"
     echo -e "  ${BOLD}${CYAN}[2]${RESET}  Every 12 hours"
     echo -e "  ${BOLD}${CYAN}[3]${RESET}  Daily at 3 AM"
@@ -535,8 +658,7 @@ schedule_backup() {
         5)
             crontab -l 2>/dev/null | grep -v "# mcserver-backup-${name}$" | crontab - 2>/dev/null || true
             success "Scheduled backup removed for '${name}'."
-            sleep 1; return
-            ;;
+            sleep 1; return ;;
         b|B|"") return ;;
         *) warn "Invalid choice."; sleep 1; return ;;
     esac
@@ -562,8 +684,7 @@ list_backups() {
 
     mapfile -t BACKUPS < <(ls -t "${backup_dir}"/*.tar.gz 2>/dev/null)
     local keep
-    keep=$(read_meta "$dir" "backup_keep")
-    keep="${keep:-5}"
+    keep=$(read_meta "$dir" "backup_keep"); keep="${keep:-5}"
 
     print_banner
     echo -e "  ${BOLD}Backups for ${name}:${RESET}"
@@ -574,8 +695,7 @@ list_backups() {
         bsize=$(du -sh "${BACKUPS[$i]}" 2>/dev/null | cut -f1)
         echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${bname}  ${DIM}(${bsize})${RESET}"
     done
-    echo
-    sep
+    echo; sep
     echo -e "  ${BOLD}${CYAN}[r]${RESET}  Restore a backup"
     echo -e "  ${BOLD}${CYAN}[d]${RESET}  Delete a backup"
     echo -e "  ${BOLD}${CYAN}[k]${RESET}  Change retention  ${DIM}(currently keeping ${keep})${RESET}"
@@ -587,15 +707,14 @@ list_backups() {
     read -rp "$(echo -e "${BOLD}Choose: ${RESET}")" choice
     echo
 
-    case "$choice" in
-        r|R)
+    case "${choice,,}" in
+        r)
             local idx
             read -rp "$(echo -e "${BOLD}Backup number to restore: ${RESET}")" idx
             if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#BACKUPS[@]} )); then
                 local chosen="${BACKUPS[$((idx-1))]}"
                 echo
                 warn "This will OVERWRITE the current server with the backup."
-                warn "World data, plugins, and configs will be replaced."
                 local confirm
                 read -rp "$(echo -e "${RED}${BOLD}Type 'yes' to confirm: ${RESET}")" confirm
                 if [[ "$confirm" == "yes" ]]; then
@@ -612,9 +731,8 @@ list_backups() {
                 fi
             else
                 warn "Invalid selection."
-            fi
-            ;;
-        d|D)
+            fi ;;
+        d)
             local idx
             read -rp "$(echo -e "${BOLD}Backup number to delete: ${RESET}")" idx
             if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#BACKUPS[@]} )); then
@@ -622,9 +740,8 @@ list_backups() {
                 success "Deleted $(basename "${BACKUPS[$((idx-1))]}")."
             else
                 warn "Invalid selection."
-            fi
-            ;;
-        k|K)
+            fi ;;
+        k)
             local new_keep
             read -rp "$(echo -e "${BOLD}How many backups to keep (currently ${keep}): ${RESET}")" new_keep
             if [[ "$new_keep" =~ ^[0-9]+$ ]] && (( new_keep >= 1 )); then
@@ -632,10 +749,9 @@ list_backups() {
                 success "Retention set to ${new_keep} backups."
             else
                 warn "Invalid number."
-            fi
-            ;;
-        s|S) schedule_backup "$dir" ;;
-        b|B|"") return ;;
+            fi ;;
+        s) schedule_backup "$dir" ;;
+        b|"") return ;;
         *) warn "Invalid choice." ;;
     esac
 
@@ -658,29 +774,20 @@ resource_monitor() {
     printf "  %-10s  %-22s  %s\n" "CPU %" "RAM used / allocated" "RAM %"
     sep
 
-    local last_pid=""
     while true; do
         if ! server_running "$dir"; then
             echo; warn "Server stopped."; break
         fi
-
         local pid
         pid=$(get_server_pid "$dir")
-
         if [[ -z "$pid" ]]; then
             printf "\r  ${DIM}Waiting for Java process...${RESET}                         "
-            last_pid=""
         else
-            # PID changed (restart) — reset last_pid so we don't show stale data
-            [[ "$pid" != "$last_pid" ]] && last_pid="$pid"
-
             local usage cpu mem_mb ram_mb mem_pct
             usage=$(get_resource_usage "$pid")
             cpu=$(echo "$usage" | cut -d' ' -f1)
             mem_mb=$(echo "$usage" | cut -d' ' -f2)
-
             if [[ "$cpu" == "?" ]]; then
-                # PID disappeared between get_server_pid and get_resource_usage
                 printf "\r  ${DIM}Process restarting...${RESET}                              "
             else
                 ram_mb=$(( ${ram:-0} * 1024 ))
@@ -690,9 +797,7 @@ resource_monitor() {
                     mem_pct="?"
                 fi
                 printf "\r  %-10s  %-22s  %s%%        " \
-                    "${cpu}%" \
-                    "${mem_mb}MB / ${ram}G" \
-                    "$mem_pct"
+                    "${cpu}%" "${mem_mb}MB / ${ram}G" "$mem_pct"
             fi
         fi
         sleep 2
@@ -703,31 +808,24 @@ resource_monitor() {
 }
 
 # =============================================================================
-#  CONSOLE LOG TAIL  (non-intrusive — no tmux attach needed)
+#  CONSOLE LOG TAIL
 # =============================================================================
 view_console_tail() {
     local dir="$1"
-    local name
+    local name sess
     name=$(server_name "$dir")
-    local sess
     sess=$(session_name "$dir")
 
     if ! server_running "$dir"; then
-        warn "Server is not running."
-        echo
-        read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
-        return
+        warn "Server is not running."; echo
+        read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"; return
     fi
 
     print_banner
     echo -e "  ${BOLD}Console output — ${name}${RESET}  ${DIM}(last 40 lines)${RESET}"
-    sep
-    echo
-    # capture-pane -p dumps the visible pane content; -J joins wrapped lines
+    sep; echo
     tmux capture-pane -p -J -t "$sess" -S -40 2>/dev/null || warn "Could not capture pane output."
-    echo
-    sep
-    echo
+    echo; sep; echo
     read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
 }
 
@@ -738,18 +836,14 @@ view_crash_logs() {
     print_banner
     echo -e "  ${BOLD}Crash Logs${RESET}"
     echo -e "  ${DIM}${LOG_BASE}${RESET}"
-    echo
-    sep
+    echo; sep
 
     mkdir -p "$LOG_BASE"
     mapfile -t LOGS < <(ls -t "${LOG_BASE}"/*.log 2>/dev/null)
 
     if [[ "${#LOGS[@]}" -eq 0 ]]; then
-        echo
-        success "No crash logs found — servers have been well-behaved!"
-        echo
-        read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
-        return
+        echo; success "No crash logs found — servers have been well-behaved!"; echo
+        read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"; return
     fi
 
     for i in "${!LOGS[@]}"; do
@@ -758,20 +852,15 @@ view_crash_logs() {
         lsize=$(du -sh "${LOGS[$i]}" 2>/dev/null | cut -f1)
         echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${lname}  ${DIM}(${lsize})${RESET}"
     done
-    echo
-    sep
-    echo -e "  ${BOLD}${CYAN}[b]${RESET}  Back"
-    echo
+    echo; sep
+    echo -e "  ${BOLD}${CYAN}[b]${RESET}  Back"; echo
 
     local choice
     read -rp "$(echo -e "${BOLD}Choose a log to view: ${RESET}")" choice
 
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#LOGS[@]} )); then
-        echo
-        sep
-        cat "${LOGS[$((choice-1))]}"
-        sep
-        echo
+        echo; sep
+        cat "${LOGS[$((choice-1))]}"; sep; echo
         read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
     fi
 }
@@ -781,16 +870,13 @@ view_crash_logs() {
 # =============================================================================
 duplicate_server() {
     local src_dir="$1"
-    local src_name
+    local src_name new_name
     src_name=$(server_name "$src_dir")
 
     print_banner
     echo -e "  ${BOLD}Duplicate server — ${src_name}${RESET}"
-    echo
-    sep
-    echo
+    echo; sep; echo
 
-    local new_name
     while true; do
         read -rp "$(echo -e "${BOLD}New server name: ${RESET}")" new_name
         new_name="${new_name// /-}"
@@ -807,9 +893,8 @@ duplicate_server() {
     echo
     local ans
     read -rp "$(echo -e "${BOLD}Copy world data too? [y/N]: ${RESET}")" ans
-    ans="${ans,,}"
     local copy_world=false
-    [[ "$ans" == "y" ]] && copy_world=true
+    [[ "${ans,,}" == "y" ]] && copy_world=true
 
     local dest_dir="${SERVERS_DIR}/${new_name}"
     info "Duplicating ${src_name} → ${new_name}..."
@@ -817,24 +902,20 @@ duplicate_server() {
     if $copy_world; then
         cp -r "$src_dir" "$dest_dir"
     else
-        # Copy everything except world folders (world, world_nether, world_the_end, and any custom ones)
         mkdir -p "$dest_dir"
-        rsync -a \
-            --exclude="world/" \
-            --exclude="world_nether/" \
-            --exclude="world_the_end/" \
-            --exclude="*.log" \
-            --exclude="logs/" \
-            "$src_dir/" "$dest_dir/" 2>/dev/null || \
-        # rsync fallback: use cp with manual world exclusion
-        ( cp -r "$src_dir/." "$dest_dir/"
-          rm -rf "${dest_dir}/world" "${dest_dir}/world_nether" "${dest_dir}/world_the_end" 2>/dev/null
-          true )
+        if command -v rsync &>/dev/null; then
+            rsync -a \
+                --exclude="world/" --exclude="world_nether/" \
+                --exclude="world_the_end/" --exclude="logs/" \
+                "$src_dir/" "$dest_dir/"
+        else
+            cp -r "$src_dir/." "$dest_dir/"
+            rm -rf "${dest_dir}/world" "${dest_dir}/world_nether" \
+                   "${dest_dir}/world_the_end" 2>/dev/null || true
+        fi
     fi
 
-    # Regenerate the watcher (it has the path embedded)
     generate_watcher "$dest_dir"
-
     success "Duplicated to ${CYAN}${dest_dir}${RESET}"
     echo
     read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
@@ -846,9 +927,7 @@ duplicate_server() {
 broadcast_all() {
     print_banner
     echo -e "  ${BOLD}Broadcast to all running servers${RESET}"
-    echo
-    sep
-    echo
+    echo; sep; echo
 
     local running=()
     for dir in "${ALL_SERVERS[@]}"; do
@@ -856,14 +935,14 @@ broadcast_all() {
     done
 
     if [[ "${#running[@]}" -eq 0 ]]; then
-        warn "No servers are currently running."
-        echo
-        read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
-        return
+        warn "No servers are currently running."; echo
+        read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"; return
     fi
 
-    echo -e "  Running servers: $(for d in "${running[@]}"; do echo -n "$(server_name "$d") "; done)"
-    echo
+    echo -ne "  Running servers: "
+    for d in "${running[@]}"; do echo -n "$(server_name "$d") "; done
+    echo; echo
+
     local cmd
     read -rp "$(echo -e "${BOLD}Command to broadcast: ${RESET}")" cmd
     echo
@@ -876,10 +955,233 @@ broadcast_all() {
         else
             local sess
             sess=$(session_name "$dir")
-            tmux send-keys -t "$sess" "$cmd" Enter 2>/dev/null && success "Sent to ${name} (tmux)" || warn "Failed: ${name}"
+            tmux send-keys -t "$sess" "$cmd" Enter 2>/dev/null && \
+                success "Sent to ${name} (tmux)" || warn "Failed: ${name}"
         fi
     done
 
+    echo
+    read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
+}
+
+# =============================================================================
+#  SECURITY & NETWORKING SETUP  (called during first-time setup)
+# =============================================================================
+setup_security_networking() {
+    local dir="$1"
+    local name
+    name=$(server_name "$dir")
+    local props="${dir}/server.properties"
+
+    print_banner
+    echo -e "  ${BOLD}Security & Networking — ${name}${RESET}"
+    echo; sep; echo
+
+    # ── Public IP ─────────────────────────────────────────────────────────────
+    info "Fetching your public IP address..."
+    local public_ip
+    public_ip=$(get_public_ip)
+    if [[ "$public_ip" != "unknown" ]]; then
+        success "Your public IP: ${BOLD}${CYAN}${public_ip}${RESET}"
+    else
+        warn "Could not determine public IP (no internet access?)."
+    fi
+    echo
+
+    # ── Server port ───────────────────────────────────────────────────────────
+    sep
+    echo -e "  ${BOLD}Server port${RESET}"
+    sep
+    local srv_port
+    while true; do
+        read -rp "$(echo -e "${BOLD}Port to run on [default: 25565]: ${RESET}")" srv_port
+        srv_port="${srv_port:-25565}"
+        if ! [[ "$srv_port" =~ ^[0-9]+$ ]] || (( srv_port < 1 || srv_port > 65535 )); then
+            warn "Invalid port number."; continue
+        fi
+        if port_in_use_locally "$srv_port"; then
+            warn "Port ${srv_port} is already in use on this machine."
+            local pans
+            read -rp "$(echo -e "${BOLD}Use it anyway? [y/N]: ${RESET}")" pans
+            [[ "${pans,,}" == "y" ]] && break
+        else
+            break
+        fi
+    done
+    write_meta "$dir" "port" "$srv_port"
+    sed -i "s/^server-port=.*/server-port=${srv_port}/" "$props" 2>/dev/null || true
+    success "Server port set to ${srv_port}."
+    echo
+
+    # ── Connectivity mode ─────────────────────────────────────────────────────
+    sep
+    echo -e "  ${BOLD}How will players connect?${RESET}"
+    sep
+    echo -e "  ${BOLD}${CYAN}[1]${RESET}  Direct IP / port forwarding  ${DIM}— classic, requires router config${RESET}"
+    echo -e "  ${BOLD}${CYAN}[2]${RESET}  Tailscale  ${DIM}— no port forwarding, players need Tailscale installed${RESET}"
+    echo
+
+    local conn_choice
+    read -rp "$(echo -e "${BOLD}Choose [1–2]: ${RESET}")" conn_choice
+
+    case "$conn_choice" in
+        2)
+            # ── Tailscale ─────────────────────────────────────────────────────
+            local ts_ip
+            ts_ip=$(get_tailscale_ip)
+            if [[ -z "$ts_ip" ]]; then
+                if ! command -v tailscale &>/dev/null; then
+                    warn "Tailscale is not installed."
+                    echo -e "  ${DIM}Install it from: ${CYAN}https://tailscale.com/download${RESET}"
+                    echo -e "  ${DIM}Then run: tailscale up${RESET}"
+                    echo
+                    read -rp "$(echo -e "${BOLD}Press Enter once Tailscale is up, or Enter to skip: ${RESET}")"
+                    ts_ip=$(get_tailscale_ip)
+                else
+                    warn "Tailscale is installed but not connected. Run: tailscale up"
+                    echo
+                    read -rp "$(echo -e "${BOLD}Press Enter once connected, or Enter to skip: ${RESET}")"
+                    ts_ip=$(get_tailscale_ip)
+                fi
+            fi
+
+            if [[ -n "$ts_ip" ]]; then
+                # Bind server to Tailscale interface only — unreachable from public internet
+                sed -i "s/^server-ip=.*/server-ip=${ts_ip}/" "$props" 2>/dev/null || \
+                    echo "server-ip=${ts_ip}" >> "$props"
+                write_meta "$dir" "tailscale_ip" "$ts_ip"
+                write_meta "$dir" "network_mode" "tailscale"
+                success "Server bound to Tailscale IP: ${BOLD}${CYAN}${ts_ip}${RESET}"
+                echo
+                echo -e "  ${BOLD}Players connect to:${RESET} ${CYAN}${ts_ip}:${srv_port}${RESET}"
+                echo -e "  ${DIM}(They must be on your Tailscale network — tailscale.com)${RESET}"
+            else
+                warn "Could not get Tailscale IP. Falling back to all interfaces."
+                write_meta "$dir" "network_mode" "public"
+            fi
+            ;;
+        *)
+            # ── Public / port-forward ─────────────────────────────────────────
+            write_meta "$dir" "network_mode" "public"
+            echo
+            if [[ "$public_ip" != "unknown" ]]; then
+                echo -e "  ${BOLD}Players connect to:${RESET} ${CYAN}${public_ip}:${srv_port}${RESET}"
+                echo -e "  ${DIM}Make sure port ${srv_port} (TCP) is forwarded on your router to this machine.${RESET}"
+                echo
+                # Check if port appears open from outside
+                info "Checking if port ${srv_port} is reachable from the internet..."
+                local ext_status
+                ext_status=$(check_external_port "$public_ip" "$srv_port")
+                case "$ext_status" in
+                    open)   success "Port ${srv_port} appears open and reachable!" ;;
+                    closed) warn "Port ${srv_port} appears closed from the internet."
+                            warn "Make sure your router is forwarding port ${srv_port} to this machine." ;;
+                    *)      warn "Could not determine port status. Check manually." ;;
+                esac
+            else
+                warn "Unknown public IP — check your router for the WAN address."
+            fi
+            echo
+
+            # Optional: configure ufw
+            if command -v ufw &>/dev/null; then
+                local ufw_ans
+                read -rp "$(echo -e "${BOLD}Configure ufw to allow port ${srv_port} and block RCON from outside? [Y/n]: ${RESET}")" ufw_ans
+                if [[ "${ufw_ans,,}" != "n" ]]; then
+                    ufw allow "${srv_port}/tcp" comment "MCServerManager - ${name}" &>/dev/null && \
+                        success "ufw: port ${srv_port} allowed." || \
+                        warn "ufw rule failed — you may need to run this as root."
+                    # Block RCON port from outside (it should only be localhost anyway)
+                    ufw deny 25575/tcp &>/dev/null || true
+                    ufw deny 25575/udp &>/dev/null || true
+                fi
+            else
+                echo -e "  ${DIM}(ufw not found — manage your firewall manually if needed)${RESET}"
+            fi
+            ;;
+    esac
+
+    echo
+    # ── RCON binding ──────────────────────────────────────────────────────────
+    sep
+    echo -e "  ${BOLD}RCON security${RESET}"
+    sep
+    local rcon_ans
+    read -rp "$(echo -e "${BOLD}Bind RCON to 127.0.0.1 only (recommended)? [Y/n]: ${RESET}")" rcon_ans
+    if [[ "${rcon_ans,,}" != "n" ]]; then
+        # Add or replace rcon.address in server.properties
+        if grep -q "^rcon.address=" "$props" 2>/dev/null; then
+            sed -i "s/^rcon.address=.*/rcon.address=127.0.0.1/" "$props"
+        else
+            echo "rcon.address=127.0.0.1" >> "$props"
+        fi
+        success "RCON bound to 127.0.0.1 — not reachable from outside."
+    else
+        warn "RCON will be accessible on all interfaces. Make sure your firewall blocks port 25575."
+    fi
+    echo
+
+    # ── Sandboxing ────────────────────────────────────────────────────────────
+    sep
+    echo -e "  ${BOLD}Java process sandboxing${RESET}"
+    sep
+    local sandbox_mode="ulimit"
+    if command -v firejail &>/dev/null; then
+        echo -e "  ${GREEN}firejail detected!${RESET} This can meaningfully restrict what the Java process can access."
+        echo
+        local fj_ans
+        read -rp "$(echo -e "${BOLD}Run server inside firejail sandbox? [Y/n]: ${RESET}")" fj_ans
+        if [[ "${fj_ans,,}" != "n" ]]; then
+            sandbox_mode="firejail"
+            success "Server will run inside firejail."
+        else
+            info "Using ulimit restrictions only."
+        fi
+    else
+        info "firejail not found — using ulimit restrictions (no core dumps, capped open files)."
+        echo -e "  ${DIM}For stronger sandboxing: pacman -S firejail | apt install firejail${RESET}"
+    fi
+    write_meta "$dir" "sandbox" "$sandbox_mode"
+    echo
+
+    # ── Whitelist ─────────────────────────────────────────────────────────────
+    sep
+    echo -e "  ${BOLD}Whitelist${RESET}"
+    sep
+    local wl_ans
+    read -rp "$(echo -e "${BOLD}Enable whitelist (only listed players can join)? [y/N]: ${RESET}")" wl_ans
+    if [[ "${wl_ans,,}" == "y" ]]; then
+        sed -i "s/^white-list=.*/white-list=true/"     "$props" 2>/dev/null || echo "white-list=true" >> "$props"
+        sed -i "s/^enforce-whitelist=.*/enforce-whitelist=true/" "$props" 2>/dev/null || echo "enforce-whitelist=true" >> "$props"
+        write_meta "$dir" "whitelist_enabled" "true"
+        success "Whitelist enabled."
+        echo
+        info "Add players to the whitelist now (leave blank to skip):"
+        while true; do
+            local pname
+            read -rp "$(echo -e "${BOLD}Player name (or Enter to finish): ${RESET}")" pname
+            [[ -z "$pname" ]] && break
+            info "Looking up UUID for ${pname}..."
+            local puuid
+            puuid=$(lookup_player_uuid "$pname")
+            if [[ -z "$puuid" ]]; then
+                warn "Could not look up UUID for ${pname} — skipping."
+            else
+                local wl_file
+                wl_file=$(sm_file "$dir" "whitelist")
+                echo "${pname} ${puuid}" >> "$wl_file"
+                rebuild_whitelist_json "$dir"
+                success "Added ${pname}."
+            fi
+        done
+    else
+        write_meta "$dir" "whitelist_enabled" "false"
+    fi
+    echo
+
+    sep
+    success "Security & networking configured."
+    sep
     echo
     read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
 }
@@ -893,15 +1195,19 @@ manage_server() {
     while true; do
         print_banner
 
-        local name type version state ram running_badge notes
+        local name type version state ram running_badge notes net_mode ts_ip port
         name=$(server_name "$dir")
         type=$(server_type "$dir")
         version=$(server_version "$dir")
         state=$(server_state "$dir")
         ram=$(get_ram "$dir")
         notes=$(server_notes "$dir")
+        net_mode=$(read_meta "$dir" "network_mode")
+        ts_ip=$(read_meta "$dir" "tailscale_ip")
+        port=$(server_port "$dir")
         [[ -z "$type" ]]    && type="unknown"
         [[ -z "$version" ]] && version="unknown"
+        [[ -z "$port" ]]    && port="25565"
 
         if server_running "$dir"; then
             running_badge="${GREEN}${BOLD}● RUNNING${RESET}"
@@ -910,11 +1216,12 @@ manage_server() {
         fi
 
         echo -e "  ${BOLD}Managing:${RESET} ${GREEN}${BOLD}${name}${RESET}  ${running_badge}"
-        echo -e "  ${DIM}Type: ${type}  |  Version: ${version}  |  Path: ${dir}${RESET}"
-        [[ "$state" == "initialized" ]] && echo -e "  ${DIM}RAM: ${ram}G${RESET}"
+        echo -e "  ${DIM}Type: ${type}  |  Version: ${version}  |  Port: ${port}  |  RAM: ${ram}G${RESET}"
+        if [[ "$net_mode" == "tailscale" && -n "$ts_ip" ]]; then
+            echo -e "  ${DIM}Connect via Tailscale: ${CYAN}${ts_ip}:${port}${RESET}"
+        fi
         [[ -n "$notes" ]] && echo -e "  ${DIM}Notes: ${notes}${RESET}"
-        echo
-        sep
+        echo; sep
 
         local options=()
 
@@ -935,6 +1242,7 @@ manage_server() {
             fi
             options+=("Backup server")
             options+=("View / restore / schedule backups")
+            options+=("Manage whitelist")
             options+=("Edit server.properties")
             options+=("Change RAM allocation")
             options+=("Duplicate server")
@@ -952,9 +1260,7 @@ manage_server() {
                     echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${GREEN}${label}${RESET}" ;;
                 "Stop server gracefully")
                     echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${YELLOW}${label}${RESET}" ;;
-                "Force stop")
-                    echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${RED}${label}${RESET}" ;;
-                "Delete server")
+                "Force stop"|"Delete server")
                     echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${RED}${label}${RESET}" ;;
                 "Change RAM allocation")
                     echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  Change RAM allocation  ${DIM}(currently ${ram}G)${RESET}" ;;
@@ -991,8 +1297,19 @@ manage_server() {
                 sleep 3
                 if server_running "$dir"; then
                     success "Server started!"
-                    echo -e "  ${DIM}Attach:  tmux attach -t ${sess}${RESET}"
-                    echo -e "  ${DIM}Detach:  Ctrl+B then D${RESET}"
+                    local disp_port disp_mode disp_ts
+                    disp_port=$(server_port "$dir"); [[ -z "$disp_port" ]] && disp_port="25565"
+                    disp_mode=$(read_meta "$dir" "network_mode")
+                    disp_ts=$(read_meta "$dir" "tailscale_ip")
+                    if [[ "$disp_mode" == "tailscale" && -n "$disp_ts" ]]; then
+                        echo -e "  ${DIM}Players connect: ${CYAN}${disp_ts}:${disp_port}${RESET}"
+                    else
+                        local pub_ip
+                        pub_ip=$(get_public_ip)
+                        [[ "$pub_ip" != "unknown" ]] && \
+                            echo -e "  ${DIM}Players connect: ${CYAN}${pub_ip}:${disp_port}${RESET}"
+                    fi
+                    echo -e "  ${DIM}Attach:  tmux attach -t ${sess}  |  Detach: Ctrl+B then D${RESET}"
                 else
                     warn "Session exited immediately. Check ${dir}/logs/ for errors."
                 fi
@@ -1045,24 +1362,22 @@ manage_server() {
                     sleep 5
                     rcon_send "$dir" "stop" &>/dev/null || true
                     sleep 3
-                    success "Stop command sent."
                 else
                     local sess
                     sess=$(session_name "$dir")
                     info "Sending stop via tmux (RCON not available)..."
                     tmux send-keys -t "$sess" "stop" Enter 2>/dev/null || warn "Could not send stop command."
                     sleep 3
-                    success "Stop command sent."
                 fi
+                success "Stop command sent."
                 read -rp "$(echo -e "${BOLD}Press Enter to continue...${RESET}")"
                 ;;
 
             "Force stop")
                 echo
                 warn "This will immediately kill the server process without a clean shutdown."
-                warn "Unsaved world data may be lost."
                 local fconfirm
-                read -rp "$(echo -e "${BOLD}Type 'yes' to confirm force stop: ${RESET}")" fconfirm
+                read -rp "$(echo -e "${BOLD}Type 'yes' to confirm: ${RESET}")" fconfirm
                 if [[ "$fconfirm" == "yes" ]]; then
                     touch "$(sm_file "$dir" "stopping")"
                     local sess fpid
@@ -1085,6 +1400,9 @@ manage_server() {
             "View / restore / schedule backups")
                 list_backups "$dir" ;;
 
+            "Manage whitelist")
+                manage_whitelist "$dir" ;;
+
             "Edit server.properties")
                 local props="${dir}/server.properties"
                 if [[ -f "$props" ]]; then
@@ -1106,13 +1424,7 @@ manage_server() {
                     warn "Please enter a whole number (e.g. 4)."
                 done
                 jar_name=$(basename "$(find "$dir" -maxdepth 1 -name "*.jar" | head -n1)")
-                cat > "${dir}/start.sh" <<EOF
-#!/usr/bin/env bash
-# MCServerManager — start script for ${name}
-cd "\$(dirname "\$0")"
-java -Xmx${new_ram}G -Xms${new_ram}G -jar ${jar_name} nogui
-EOF
-                chmod +x "${dir}/start.sh"
+                _write_start_sh "$dir" "$jar_name" "$new_ram"
                 success "RAM updated to ${new_ram}G."
                 server_running "$dir" && warn "Restart the server to apply."
                 sleep 1
@@ -1163,11 +1475,13 @@ EOF
                     warn "Stop the server before deleting."; sleep 2; continue
                 fi
                 warn "This will permanently delete ${BOLD}${name}${RESET} and ALL its files."
-                warn "World data, plugins, configs — everything."
-                echo
                 local confirm
                 read -rp "$(echo -e "${RED}${BOLD}Type the server name to confirm: ${RESET}")" confirm
                 if [[ "$confirm" == "$name" ]]; then
+                    # Remove ufw rule if present
+                    local del_port
+                    del_port=$(server_port "$dir"); [[ -z "$del_port" ]] && del_port="25565"
+                    command -v ufw &>/dev/null && ufw delete allow "${del_port}/tcp" &>/dev/null || true
                     rm -rf "$dir"
                     success "Server '${name}' deleted."
                     sleep 1; return
@@ -1183,6 +1497,34 @@ EOF
 }
 
 # =============================================================================
+#  WRITE start.sh  (shared between setup and RAM change)
+# =============================================================================
+_write_start_sh() {
+    local dir="$1" jar_name="$2" ram_gb="$3"
+    local name sandbox
+    name=$(server_name "$dir")
+    sandbox=$(read_meta "$dir" "sandbox")
+
+    local java_cmd
+    if [[ "$sandbox" == "firejail" ]] && command -v firejail &>/dev/null; then
+        java_cmd="firejail --quiet java"
+    else
+        java_cmd="java"
+    fi
+
+    cat > "${dir}/start.sh" <<EOF
+#!/usr/bin/env bash
+# MCServerManager — start script for ${name}
+cd "\$(dirname "\$0")"
+# Sandbox: no core dumps, cap open file descriptors
+ulimit -c 0
+ulimit -n 8192
+exec ${java_cmd} -Xmx${ram_gb}G -Xms${ram_gb}G -jar ${jar_name} nogui
+EOF
+    chmod +x "${dir}/start.sh"
+}
+
+# =============================================================================
 #  FIRST-TIME SETUP
 # =============================================================================
 run_first_time_setup() {
@@ -1193,13 +1535,9 @@ run_first_time_setup() {
     [[ -z "$type" ]] && type="unknown"
     jar_name=$(basename "$(find "$dir" -maxdepth 1 -name "*.jar" | head -n1)")
 
-    echo
-    sep
+    echo; sep
     info "Running first-time setup for ${BOLD}${name}${RESET} (${type})..."
-
-    # Java version check before first run
     check_java_for_server "$dir"
-
     echo -e "  ${YELLOW}(The server will stop after generating eula.txt)${RESET}"
     echo
 
@@ -1220,21 +1558,21 @@ run_first_time_setup() {
     if [[ -f "${dir}/server.properties" ]] && command -v mcrcon &>/dev/null; then
         info "Configuring RCON..."
         local rcon_pass rcon_port_num
-        rcon_pass=$(openssl rand -hex 12)
+        rcon_pass=$(openssl rand -hex 16)
         rcon_port_num=25575
         sed -i "s/^enable-rcon=.*/enable-rcon=true/"             "${dir}/server.properties"
         sed -i "s/^rcon.port=.*/rcon.port=${rcon_port_num}/"     "${dir}/server.properties"
         sed -i "s/^rcon.password=.*/rcon.password=${rcon_pass}/" "${dir}/server.properties"
         write_conf "$dir" "rcon_password" "$rcon_pass"
         write_conf "$dir" "rcon_port"     "$rcon_port_num"
-        success "RCON configured (password stored in ${dir}/.mcserver.conf)."
+        # write_conf already chmods 600
+        success "RCON configured."
     else
         warn "Skipping RCON setup (mcrcon not installed or server.properties not found)."
     fi
 
     # ── RAM allocation ────────────────────────────────────────────────────────
-    echo
-    sep
+    echo; sep
     local ram_gb
     while true; do
         read -rp "$(echo -e "${BOLD}How much RAM (in GB) to dedicate to this server? ${RESET}")" ram_gb
@@ -1242,25 +1580,23 @@ run_first_time_setup() {
         warn "Please enter a whole number (e.g. 4)."
     done
 
-    cat > "${dir}/start.sh" <<EOF
-#!/usr/bin/env bash
-# MCServerManager — start script for ${name}
-cd "\$(dirname "\$0")"
-java -Xmx${ram_gb}G -Xms${ram_gb}G -jar ${jar_name} nogui
-EOF
-    chmod +x "${dir}/start.sh"
+    # Placeholder start.sh — will be rewritten after security setup knows sandbox mode
+    write_meta "$dir" "sandbox" "ulimit"
+
+    # ── Security & Networking ─────────────────────────────────────────────────
+    setup_security_networking "$dir"
+
+    # Now write start.sh with final sandbox mode
+    _write_start_sh "$dir" "$jar_name" "$ram_gb"
 
     generate_watcher "$dir"
-
     [[ -z "$(read_meta "$dir" "backup_keep")" ]] && write_meta "$dir" "backup_keep" "5"
 
     echo
-    success "start.sh created with ${ram_gb}G RAM."
+    success "Setup complete for ${BOLD}${name}${RESET}!"
     sep
-    echo -e "  ${BOLD}${GREEN}Setup complete for ${name}!${RESET}"
     echo -e "  Start the server from the main menu."
-    sep
-    echo
+    sep; echo
     read -rp "$(echo -e "${BOLD}Press Enter to return to the main menu...${RESET}")"
 }
 
@@ -1270,11 +1606,8 @@ EOF
 add_new_server() {
     print_banner
     echo -e "  ${BOLD}Add a new server${RESET}"
-    echo
-    sep
-    echo
+    echo; sep; echo
 
-    # ── Server name ───────────────────────────────────────────────────────────
     local srv_name
     while true; do
         read -rp "$(echo -e "${BOLD}Server name (e.g. survival, creative, lobby): ${RESET}")" srv_name
@@ -1289,7 +1622,6 @@ add_new_server() {
         echo
     done
 
-    # ── Minecraft version ─────────────────────────────────────────────────────
     echo
     local srv_version
     while true; do
@@ -1299,11 +1631,8 @@ add_new_server() {
         echo
     done
 
-    # ── Server software ───────────────────────────────────────────────────────
-    echo
-    sep
-    echo -e "  ${BOLD}Server software:${RESET}"
-    sep
+    echo; sep
+    echo -e "  ${BOLD}Server software:${RESET}"; sep
     echo -e "  ${BOLD}${CYAN}[1]${RESET}  LeafMC   ${DIM}— optimised fork of Paper${RESET}"
     echo -e "  ${BOLD}${CYAN}[2]${RESET}  Paper    ${DIM}— most popular high-performance fork${RESET}"
     echo -e "  ${BOLD}${CYAN}[3]${RESET}  Purpur   ${DIM}— Paper fork with extra configurability${RESET}"
@@ -1326,7 +1655,6 @@ add_new_server() {
         esac
     done
 
-    # ── Open download page ────────────────────────────────────────────────────
     local dest_dir="${SERVERS_DIR}/${srv_name}"
     mkdir -p "$dest_dir"
     mkdir -p "$(sm_dir "$dest_dir")"
@@ -1340,12 +1668,9 @@ add_new_server() {
     local jar_src
     while true; do
         read -rp "$(echo -e "${BOLD}Full path to the downloaded JAR: ${RESET}")" jar_src
-        jar_src="${jar_src//\'/}"
-        jar_src="${jar_src//\"/}"
-        jar_src="${jar_src/#\~/$HOME}"
+        jar_src="${jar_src//\'/}"; jar_src="${jar_src//\"/}"; jar_src="${jar_src/#\~/$HOME}"
         [[ -f "$jar_src" ]] && break
-        warn "File not found: ${jar_src}"
-        echo
+        warn "File not found: ${jar_src}"; echo
     done
 
     mv "$jar_src" "${dest_dir}/server.jar"
@@ -1408,13 +1733,10 @@ stop_all_servers() {
 }
 
 # =============================================================================
-#  CLI BACKUP MODE (called by cron: server.sh --backup <name>)
+#  CLI BACKUP MODE  (called by cron: server.sh --backup <name>)
 # =============================================================================
 if [[ "$_CLI_BACKUP" -eq 1 ]]; then
-    if [[ ! -d "$_CLI_DIR" ]]; then
-        echo "Server '${_CLI_NAME}' not found at ${_CLI_DIR}." >&2
-        exit 1
-    fi
+    [[ ! -d "$_CLI_DIR" ]] && { echo "Server '${_CLI_NAME}' not found." >&2; exit 1; }
     backup_server "$_CLI_DIR"
     exit 0
 fi
@@ -1432,8 +1754,7 @@ while true; do
     scan_servers || true
 
     if [[ "${#ALL_SERVERS[@]}" -gt 0 ]]; then
-        echo -e "  ${BOLD}Your servers:${RESET}"
-        sep
+        echo -e "  ${BOLD}Your servers:${RESET}"; sep
         for i in "${!ALL_SERVERS[@]}"; do
             _dir="${ALL_SERVERS[$i]}"
             _name=$(server_name "$_dir")
@@ -1445,11 +1766,7 @@ while true; do
             [[ -z "$_type" ]]    && _type="?"
             [[ -z "$_version" ]] && _version="?"
 
-            if server_running "$_dir"; then
-                _dot="${GREEN}●${RESET}"
-            else
-                _dot="${DIM}○${RESET}"
-            fi
+            server_running "$_dir" && _dot="${GREEN}●${RESET}" || _dot="${DIM}○${RESET}"
 
             case "$_state" in
                 fresh)       _badge="${YELLOW}needs setup${RESET}" ;;
@@ -1459,11 +1776,9 @@ while true; do
 
             _notes_str=""
             [[ -n "$_notes" ]] && _notes_str="  ${DIM}${_notes}${RESET}"
-
             echo -e "  ${BOLD}${CYAN}[$((i+1))]${RESET}  ${_dot}  ${BOLD}${_name}${RESET}  ${DIM}|${RESET}  ${_badge}${_notes_str}"
         done
-        echo
-        sep
+        echo; sep
 
         _n="${#ALL_SERVERS[@]}"
         IDX_STARTALL=$(( _n + 1 ))
@@ -1480,41 +1795,28 @@ while true; do
         echo -e "  ${BOLD}${CYAN}[${IDX_ADD}]${RESET}  Add a new server"
         echo -e "  ${BOLD}${CYAN}[${IDX_QUIT}]${RESET}  Quit"
     else
-        info "No servers found in ${SERVERS_DIR}."
-        echo
-        sep
-        IDX_STARTALL=-1
-        IDX_STOPALL=-1
-        IDX_BROADCAST=-1
-        IDX_LOGS=-1
-        IDX_ADD=1
-        IDX_QUIT=2
-
+        info "No servers found in ${SERVERS_DIR}."; echo; sep
+        IDX_STARTALL=-1; IDX_STOPALL=-1; IDX_BROADCAST=-1; IDX_LOGS=-1
+        IDX_ADD=1; IDX_QUIT=2
         echo -e "  ${BOLD}${CYAN}[${IDX_ADD}]${RESET}  Add a new server"
         echo -e "  ${BOLD}${CYAN}[${IDX_QUIT}]${RESET}  Quit"
     fi
 
     echo
-
     read -rp "$(echo -e "${BOLD}Choose an option: ${RESET}")" main_choice
 
     if ! [[ "$main_choice" =~ ^[0-9]+$ ]]; then
         warn "Please enter a number."; sleep 1; continue
     fi
 
-    if (( main_choice == IDX_QUIT )); then
-        echo; info "Bye!"; echo; exit 0
-    elif (( main_choice == IDX_ADD )); then
-        add_new_server
-    elif (( IDX_STARTALL > 0 && main_choice == IDX_STARTALL )); then
-        start_all_servers
-    elif (( IDX_STOPALL > 0 && main_choice == IDX_STOPALL )); then
-        stop_all_servers
-    elif (( IDX_BROADCAST > 0 && main_choice == IDX_BROADCAST )); then
-        broadcast_all
-    elif (( IDX_LOGS > 0 && main_choice == IDX_LOGS )); then
-        view_crash_logs
-    elif [[ "${#ALL_SERVERS[@]}" -gt 0 ]] && (( main_choice >= 1 && main_choice <= ${#ALL_SERVERS[@]} )); then
+    if   (( main_choice == IDX_QUIT ));                                   then echo; info "Bye!"; echo; exit 0
+    elif (( main_choice == IDX_ADD ));                                    then add_new_server
+    elif (( IDX_STARTALL   > 0 && main_choice == IDX_STARTALL ));        then start_all_servers
+    elif (( IDX_STOPALL    > 0 && main_choice == IDX_STOPALL ));         then stop_all_servers
+    elif (( IDX_BROADCAST  > 0 && main_choice == IDX_BROADCAST ));       then broadcast_all
+    elif (( IDX_LOGS       > 0 && main_choice == IDX_LOGS ));            then view_crash_logs
+    elif [[ "${#ALL_SERVERS[@]}" -gt 0 ]] && \
+         (( main_choice >= 1 && main_choice <= ${#ALL_SERVERS[@]} ));    then
         manage_server "${ALL_SERVERS[$((main_choice-1))]}"
     else
         warn "Invalid selection."; sleep 1
