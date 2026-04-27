@@ -26,7 +26,7 @@ Install these packages if they're not installed already:
 
 ```bash
 # On Arch
-sudo pacman -S tmux curl openssl
+sudo pacman -S tmux curl openssl tailscale ufw firejail
 paru -S mcrcon
 ```
 
